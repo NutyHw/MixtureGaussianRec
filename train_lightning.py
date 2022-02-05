@@ -11,6 +11,7 @@ from ndcg import ndcg
 import torch.optim as optim
 import pytorch_lightning as pl
 
+import ray
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
@@ -34,7 +35,7 @@ class ModelTrainer( pl.LightningModule ):
         self.gamma = config['gamma']
 
     def download_data( self ):
-        self.dataset = YelpDataset( self.config['relation_id'] )
+        self.dataset = ray.get( dataset )
         self.reg_mat = self.dataset.get_reg_mat()
 
     def train_dataloader( self ):
@@ -193,6 +194,7 @@ def test_model( config : dict, checkpoint_dir : str ):
         json.dump( save_json, f )
 
 def tune_model( relation_id : int ):
+    dataset = ray.put( YelpDataset( relation_id ) )
     config = {
         # grid search parameter
         # 'num_latent' : tune.grid_search([ 4, 8, 16, 32 ]),
