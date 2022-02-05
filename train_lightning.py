@@ -1,5 +1,7 @@
 import os
 import json 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,14 +19,12 @@ from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
-# some hack from https://github.com/ray-project/ray/issues/10995
-os.environ["SLURM_JOB_NAME"] = "bash"
-
 class ModelTrainer( pl.LightningModule ):
-    def __init__( self, config : dict ):
+    def __init__( self, config : dict, dataset=None ):
         super().__init__()
         self.config = config
-        self.download_data()
+        self.dataset = ray.get( dataset )
+        self.reg_mat = self.dataset.get_reg_mat()
 
         self.model = Model( self.dataset.n_users, self.dataset.n_items, self.reg_mat.shape[0], config['num_group'], config['num_latent'] )
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
@@ -33,10 +33,6 @@ class ModelTrainer( pl.LightningModule ):
         self.alpha = config['alpha']
         self.beta = config['beta']
         self.gamma = config['gamma']
-
-    def download_data( self ):
-        self.dataset = ray.get( dataset )
-        self.reg_mat = self.dataset.get_reg_mat()
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=0 )
@@ -155,7 +151,7 @@ class ModelTrainer( pl.LightningModule ):
         optimizer = optim.RMSprop( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
-def train_model( config, checkpoint_dir=None ):
+def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         max_epochs=1, 
         limit_train_batches=1,
@@ -173,7 +169,7 @@ def train_model( config, checkpoint_dir=None ):
         ]
     )
 
-    model = ModelTrainer( config )
+    model = ModelTrainer( config, dataset )
 
     trainer.fit( model )
 
@@ -197,12 +193,9 @@ def tune_model( relation_id : int ):
     dataset = ray.put( YelpDataset( relation_id ) )
     config = {
         # grid search parameter
-        # 'num_latent' : tune.grid_search([ 4, 8, 16, 32 ]),
-        # 'gamma' : tune.grid_search([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        # 'num_group' : tune.grid_search([ 5 * i for i in range( 1, 11 ) ]),
-        'num_latent' : tune.grid_search([ 4 ]),
-        'gamma' : tune.grid_search([ 1e-5 ]),
-        'num_group' : tune.grid_search([ 5 ]),
+        'num_latent' : tune.grid_search([ 4, 8, 16, 32 ]),
+        'gamma' : tune.grid_search([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
+        'num_group' : tune.grid_search([ 5 * i for i in range( 1, 11 ) ]),
 
         # hopefully will find right parameter
         'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
@@ -228,7 +221,7 @@ def tune_model( relation_id : int ):
     )
 
     analysis = tune.run( 
-        train_model,
+        partial( train_model, dataset=dataset ),
         resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_10',
         mode='max',
