@@ -84,7 +84,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def training_step( self, batch, batch_idx ):
         pos_interact, neg_interact = batch
-        batch_size = self.config['batch_size']
+        batch_size = pos_interact.shape[0]
 
         input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
         res = self.model( input_idx[:,0], input_idx[:,1] )
@@ -153,8 +153,7 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1, 
-        limit_train_batches=1,
+        max_epochs=128, 
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
@@ -166,7 +165,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            )
-        ]
+        ],
+        progress_bar_refresh_rate=0
     )
 
     model = ModelTrainer( config, dataset )
@@ -175,8 +175,6 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
 
 def test_model( config : dict, checkpoint_dir : str ):
     model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ) )
-    # checkpoint = torch.load( os.path.join( checkpoint_dir, 'checkpoint' ) )
-    # model = model.load_state_dict( checkpoint["state_dict"] )
 
     trainer = pl.Trainer()
     result = trainer.test( model )
@@ -190,6 +188,7 @@ def test_model( config : dict, checkpoint_dir : str ):
         json.dump( save_json, f )
 
 def tune_model( relation_id : int ):
+    ray.init( num_cpus=10 )
     dataset = ray.put( YelpDataset( relation_id ) )
     config = {
         # grid search parameter
@@ -222,9 +221,10 @@ def tune_model( relation_id : int ):
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_10',
         mode='max',
+        verbose=0,
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,

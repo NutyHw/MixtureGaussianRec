@@ -5,7 +5,7 @@ from filelock import FileLock
 
 class YelpDataset( Dataset ):
     def __init__( self, r : int ):
-        dataset_dir = '/Users/nuttupoomsaitoh/Desktop/class/seminar/PantipRec/process_datasets/yelp2018/'
+        dataset_dir = '/home/saito/MixtureGaussianRec/process_datasets/yelp2018/'
         self.relation_dir = os.path.join( dataset_dir, 'relation_mat' )
         self.train_adj_mat = torch.load( os.path.join( dataset_dir, 'train_adj_mat.pt' ) )
 
