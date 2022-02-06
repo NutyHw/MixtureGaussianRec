@@ -74,7 +74,7 @@ class ModelTrainer( pl.LightningModule ):
 
         _, top_k_indices = torch.topk( predict_rating, k=10, dim=-1, largest=True )
 
-        recall_10 = torch.nanmean( 
+        recall_10 = torch.mean( 
             torch.sum( torch.gather( true_rating, dim=1, index = top_k_indices ), dim=-1 )
         )
 
@@ -197,14 +197,14 @@ def tune_model( relation_id : int ):
         'num_group' : tune.grid_search([ 5 * i for i in range( 1, 11 ) ]),
 
         # hopefully will find right parameter
-        'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
-        'lr' : tune.choice([ 0.05, 0.01, 0.005, 0.001 ]),
+        'batch_size' : 512,
+        'lr' : 0.01,
         'alpha' : 1,
-        'beta' : tune.qrandint( 50, 1000, 50 ),
-        'min_lambda' : tune.quniform( 0.6, 0.8, 5e-2 ),
-        'prediction_margin' : tune.quniform( 0.1, 5, 0.1 ),
-        'transition_margin' : tune.quniform( 0.1, 5, 0.1 ),
-        'lambda' : tune.quniform( 0.7, 0.95, 1e-2 ),
+        'beta' : 200,
+        'min_lambda' : 0.75,
+        'prediction_margin' : 0.5,
+        'transition_margin' : 0.01,
+        'lambda' : 0.8,
         'relation_id' : relation_id
     }
 
