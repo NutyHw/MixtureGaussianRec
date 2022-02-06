@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 import ray
 from ray import tune
@@ -27,15 +28,15 @@ class ModelTrainer( pl.LightningModule ):
         self.reg_mat = self.dataset.get_reg_mat()
 
         self.model = Model( self.dataset.n_users, self.dataset.n_items, self.reg_mat.shape[0], config['num_group'], config['num_latent'] )
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
+        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='sum' )
 
         self.alpha = config['alpha']
         self.beta = config['beta']
         self.gamma = config['gamma']
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=0 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=2 )
 
     def val_dataloader( self ):
         x = self.dataset.get_val()
@@ -43,7 +44,7 @@ class ModelTrainer( pl.LightningModule ):
         y[ :, 0 ] = 1
         y = y.reshape( -1, 1 )
 
-        return DataLoader( TensorDataset( x, y ), batch_size=2048, shuffle=False, num_workers=0 )
+        return DataLoader( TensorDataset( x, y ), batch_size=2048, shuffle=False, num_workers=2 )
 
     def test_dataloader( self ):
         x = self.dataset.get_test()
@@ -51,7 +52,7 @@ class ModelTrainer( pl.LightningModule ):
         y[ :, 0 ] = 1
         y = y.reshape( -1, 1 )
 
-        return DataLoader( TensorDataset( x, y ), batch_size=2048, shuffle=False, num_workers=0 )
+        return DataLoader( TensorDataset( x, y ), batch_size=2048, shuffle=False, num_workers=2 )
 
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
         return torch.mean( torch.relu( - ( pos_result1 - neg_result1 + self.config['prediction_margin'] ) * ( pos_result2 - neg_result2 + self.config['transition_margin'] ) ) )
@@ -101,7 +102,10 @@ class ModelTrainer( pl.LightningModule ):
         category_reg = F.kl_div( res['category_kg'], self.reg_mat.T[ item_idx ] )
         normal_loss = self.normal_regularization( res['distribution'][0] ) + self.normal_regularization( res['distribution'][1] )
 
-        return l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * ( normal_loss + category_reg )
+        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * ( normal_loss + category_reg )
+        self.log_dict({ 'loss' : loss.item() })
+
+        return loss
 
     def on_train_epoch_end( self ):
         self.alpha = max( self.alpha * self.config['lambda'], self.config['alpha'] * self.config['min_lambda'] )
@@ -148,7 +152,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.RMSprop( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -164,7 +168,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             },
             on='validation_end',
             filename='checkpoint'
-           )
+           ),
+           EarlyStopping(monitor="ndcg_10", patience=10, mode="max", min_delta=0.01)
         ],
         progress_bar_refresh_rate=0
     )
@@ -192,19 +197,19 @@ def tune_model( relation_id : int ):
     dataset = ray.put( YelpDataset( relation_id ) )
     config = {
         # grid search parameter
-        'num_latent' : tune.grid_search([ 4, 8, 16, 32 ]),
+        'num_latent' : tune.grid_search([ 8, 16, 32 ]),
         'gamma' : tune.grid_search([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
         'num_group' : tune.grid_search([ 5 * i for i in range( 1, 11 ) ]),
 
         # hopefully will find right parameter
-        'batch_size' : 512,
+        'batch_size' : 1024,
         'lr' : 0.01,
         'alpha' : 1,
-        'beta' : 200,
+        'beta' : 1,
         'min_lambda' : 0.75,
-        'prediction_margin' : 0.5,
-        'transition_margin' : 0.01,
-        'lambda' : 0.8,
+        'prediction_margin' : 1,
+        'transition_margin' : 1,
+        'lambda' : 0.9,
         'relation_id' : relation_id
     }
 
@@ -228,7 +233,10 @@ def tune_model( relation_id : int ):
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,
-        name=f'yelp_relation_{relation_id}'
+        name=f'yelp_relation_{relation_id}',
+        local_dir="/data2/saito/",
+        keep_checkpoints_num=1, 
+        checkpoint_score_attr='ndcg_10'
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint )
