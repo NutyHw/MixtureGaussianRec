@@ -50,7 +50,7 @@ class YelpDataset( Dataset ):
         user_mask = torch.sum( relation_adj_mat, dim=-1 ) > 0
 
         num_samples = torch.sum( relation_adj_mat, dim=-1 ).tolist()
-        neg_train = torch.zeros( ( 0, 2 ) )
+        neg_train = torch.zeros( ( 0, 2 ), dtype=torch.long )
 
         for uid in torch.arange( self.train_adj_mat.shape[0] )[ user_mask ].tolist():
             neg_items = torch.multinomial( relation_neg_adj_mat[ uid ], num_samples=int( num_samples[ uid ] ) ).reshape( -1, 1 )
@@ -60,5 +60,5 @@ class YelpDataset( Dataset ):
         self.pos_train, self.neg_train = relation_adj_mat.nonzero(), neg_train
 
 if __name__ == '__main__':
-    dataset = YelpDataset( 1 )
-    print( dataset[0] )
+    dataset = YelpDataset( 0 )
+    print( dataset[256] )
