@@ -5,14 +5,13 @@ from filelock import FileLock
 
 class YelpDataset( Dataset ):
     def __init__( self, r : int ):
-        dataset_dir = '/home/saito/MixtureGaussianRec/process_datasets/yelp2018/'
+        dataset_dir = '../../process_datasets/yelp2018/'
         self.relation_dir = os.path.join( dataset_dir, 'relation_mat' )
         self.train_adj_mat = torch.load( os.path.join( dataset_dir, 'train_adj_mat.pt' ) )
 
         self.n_users = self.train_adj_mat.shape[0]
         self.n_items = self.train_adj_mat.shape[1]
 
-        self.sample_size = 20
         self.load_dataset( r )
         self.sampling()
 
@@ -50,17 +49,16 @@ class YelpDataset( Dataset ):
 
         user_mask = torch.sum( relation_adj_mat, dim=-1 ) > 0
 
-        pos_items = torch.multinomial( relation_adj_mat[ user_mask, : ], num_samples=self.sample_size, replacement=True )
-        neg_items = torch.multinomial( relation_neg_adj_mat[ user_mask, : ], num_samples=self.sample_size, replacement=True )
+        num_samples = torch.sum( relation_adj_mat, dim=-1 ).tolist()
+        neg_train = torch.zeros( ( 0, 2 ) )
 
-        user_idx = torch.arange( self.train_adj_mat.shape[0] )[ user_mask ].reshape( -1, 1 ).tile( 1, self.sample_size ).reshape( -1, 1 )
+        for uid in torch.arange( self.train_adj_mat.shape[0] )[ user_mask ].tolist():
+            neg_items = torch.multinomial( relation_neg_adj_mat[ uid ], num_samples=int( num_samples[ uid ] ) ).reshape( -1, 1 )
+            user_idx = torch.full( ( int( num_samples[ uid ] ), 1 ), uid, dtype=torch.long )
+            neg_train = torch.vstack( ( neg_train, torch.hstack( ( user_idx, neg_items ) ) ) )
 
-        self.pos_train, self.neg_train = torch.hstack( ( user_idx, pos_items.reshape( -1, 1 ) ) ), torch.hstack( ( user_idx, neg_items.reshape( -1, 1 ) ) )
+        self.pos_train, self.neg_train = relation_adj_mat.nonzero(), neg_train
 
 if __name__ == '__main__':
-    dataset = YelpDataset( 0 )
-    print( len( dataset ) )
-    print( dataset[0], dataset[1] )
-    print( dataset.get_reg_mat().shape )
-    print( dataset.get_test().shape )
-    print( dataset.get_val().shape )
+    dataset = YelpDataset( 1 )
+    print( dataset[0] )
