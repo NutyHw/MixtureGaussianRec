@@ -197,19 +197,19 @@ def tune_model( relation_id : int ):
     dataset = ray.put( YelpDataset( relation_id ) )
     config = {
         # grid search parameter
-        'num_latent' : tune.grid_search([ 8, 16, 32 ]),
-        'gamma' : tune.grid_search([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        'num_group' : tune.grid_search([ 5 * i for i in range( 1, 11 ) ]),
+        'num_latent' : tune.choice([ 8, 16, 32 ]),
+        'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
+        'num_group' : tune.qrandint( 5, 50, 5 ),
 
         # hopefully will find right parameter
-        'batch_size' : 1024,
-        'lr' : 0.01,
-        'alpha' : 1,
-        'beta' : 1,
-        'min_lambda' : 0.75,
-        'prediction_margin' : 1,
-        'transition_margin' : 1,
-        'lambda' : 0.9,
+        'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
+        'lr' : tune.quniform( 1e-3, 1e-2, 1e-1 ),
+        'alpha' : tune.quniform( 10, 200, 10 ),
+        'beta' : tune.qrandint( 10, 100, 10 ),
+        'min_lambda' : tune.quniform( 0.6, 0.8, 1e-2 ),
+        'prediction_margin' : tune.quniform( 1e-3, 10, 1e-3 ),
+        'transition_margin' : tune.quniform( 1e-3, 10, 1e-3 ),
+        'lambda' : tune.quniform(0.85,0.99,1e-2),
         'relation_id' : relation_id
     }
 
@@ -229,7 +229,8 @@ def tune_model( relation_id : int ):
         resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_10',
         mode='max',
-        verbose=0,
+        num_samples=300,
+        verbose=1,
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,
