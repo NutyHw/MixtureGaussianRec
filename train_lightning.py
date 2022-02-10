@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.model import Model
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.yelp_dataset import YelpDataset
+from utilities.dataset.ml1m_dataset import Ml1mDataset
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -178,8 +178,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
 
     trainer.fit( model )
 
-def test_model( config : dict, checkpoint_dir : str ):
-    model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ) )
+def test_model( config : dict, checkpoint_dir : str, dataset ):
+    model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ), dataset=dataset )
 
     trainer = pl.Trainer()
     result = trainer.test( model )
@@ -193,8 +193,8 @@ def test_model( config : dict, checkpoint_dir : str ):
         json.dump( save_json, f )
 
 def tune_model( relation_id : int ):
-    ray.init( num_cpus=10 )
-    dataset = ray.put( YelpDataset( relation_id ) )
+    ray.init( num_cpus=1 )
+    dataset = ray.put( Ml1mDataset( relation_id ) )
     config = {
         # grid search parameter
         'num_latent' : tune.choice([ 8, 16, 32 ]),
@@ -203,7 +203,7 @@ def tune_model( relation_id : int ):
 
         # hopefully will find right parameter
         'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
-        'lr' : tune.quniform( 1e-3, 1e-2, 1e-1 ),
+        'lr' : tune.quniform( 1e-3, 1e-2, 1e-3 ),
         'alpha' : tune.quniform( 10, 200, 10 ),
         'beta' : tune.qrandint( 10, 100, 10 ),
         'min_lambda' : tune.quniform( 0.6, 0.8, 1e-2 ),
@@ -214,8 +214,8 @@ def tune_model( relation_id : int ):
     }
 
     scheduler = ASHAScheduler(
-        max_t=128,
-        grace_period=5,
+        max_t=1,
+        grace_period=1,
         reduction_factor=2
     )
 
@@ -226,21 +226,21 @@ def tune_model( relation_id : int ):
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_10',
         mode='max',
-        num_samples=300,
+        num_samples=2,
         verbose=1,
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,
         name=f'yelp_relation_{relation_id}',
-        local_dir="/data2/saito/",
+        local_dir=".",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_10'
     )
 
-    test_model( analysis.best_config, analysis.best_checkpoint )
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset=dataset )
 
 if __name__ == '__main__':
     tune_model( 0 )
