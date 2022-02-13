@@ -14,7 +14,10 @@ class Ml1mDataset( Dataset ):
         self.n_users = self.train_adj_mat.shape[0]
         self.n_items = self.train_adj_mat.shape[1]
 
-        self.load_dataset( r )
+        if r > -1:
+            self.load_dataset( r )
+        else:
+            self.interact_mapper = torch.zeros( ( 1, 1 ) )
         self.sampling()
 
     def __len__( self ):
@@ -33,6 +36,8 @@ class Ml1mDataset( Dataset ):
         return self.interact_mapper
 
     def load_dataset( self, r ):
+        if r == -1:
+            self.interact_mapper = torch.ones( ( self.n_users, self.n_items ) )
         interact_mapper = torch.load( os.path.join( self.relation_dir, str(r), 'interact.pt' ) )
 
         self.interact_mapper = interact_mapper
@@ -56,4 +61,6 @@ class Ml1mDataset( Dataset ):
 if __name__ == '__main__':
     dataset = Ml1mDataset( 2 )
     print( dataset.get_reg_mat().shape )
-    print( dataset[256] )
+    print( dataset.n_users )
+    # print( dataset.get_reg_mat().shape )
+    # print( dataset[256] )
