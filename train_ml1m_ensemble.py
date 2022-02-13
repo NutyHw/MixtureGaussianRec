@@ -5,6 +5,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from models.model import Model
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.ml1m_dataset import Ml1mDataset
@@ -32,13 +33,16 @@ class Ml1mEnsembleModel( pl.LightningModule ):
         self.model1.train(False)
         self.model2.train(False)
         self.model3.train(False)
-        self.classifier = nn.Linear( 3, 1, bias=False )
+
+        self.prediction_ensemble = nn.Parameter( torch.normal( 0, 1 ( 1, 3 ) ) )
+        self.transition_ensemble = nn.Parameter( torch.normal( 0, 1 ( 1, 3 ) ) )
 
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
         self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='sum' )
 
         self.alpha = config['alpha']
         self.beta = config['beta']
+        self.gamma = config['gamma']
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=2 )
@@ -86,8 +90,8 @@ class Ml1mEnsembleModel( pl.LightningModule ):
         res2 = self.model2( input_idx[:,1], input_idx[:,0] )
         res3 = self.model2( input_idx[:,1], input_idx[:,0] )
 
-        res_out = self.classifier( torch.hstack( ( res['out'], res2['out'], res3['out'] ) ) )
-        kg_prob = self.classifier( torch.hstack( ( res['kg_prob'], res2['kg_prob'], res3['kg_prob'] ) ) )
+        res_out = torch.hstack( ( res['out'], res2['out'], res3['out'] ) ) * self.prediction_ensemble
+        kg_prob = torch.hstack( ( res['kg_prob'], res2['kg_prob'], res3['kg_prob'] ) ) * self.transition_ensemble
 
         pos_res_out, neg_res_out = torch.split( res_out, split_size_or_sections=batch_size, dim=0 )
         pos_res_kg_prob, neg_res_kg_prob = torch.split( kg_prob, split_size_or_sections=batch_size, dim=0 )
@@ -98,7 +102,8 @@ class Ml1mEnsembleModel( pl.LightningModule ):
         l3_loss = self.joint_loss( pos_res_out, neg_res_out, pos_res_kg_prob, neg_res_kg_prob )
 
         # regularization loss
-        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss
+        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + ( F.kl_div( torch.log( self.prediction_ensemble ), self.transition_ensemble ) + F.kl_div( torch.log( self.transition_ensemble ) ,self.prediction_ensemble ) ) * self.gamma
+
         self.log_dict({ 'loss' : loss.item() })
 
         return loss
@@ -118,7 +123,7 @@ class Ml1mEnsembleModel( pl.LightningModule ):
         model2_res = self.model2( interact[:,1], interact[:,0] )['kg_prob']
         model3_res = self.model3( interact[:,1], interact[:,0] )['kg_prob']
 
-        res  = self.classifier( torch.hstack( ( model1_res, model2_res, model3_res ) ) )
+        res = torch.hstack( ( model1_res, model2_res, model3_res ) ) * self.transition_ensemble
 
         self.predict_score = torch.vstack( ( self.predict_score, res ) )
         self.true_score = torch.vstack( ( self.true_score, y ) )
@@ -207,7 +212,7 @@ def load_model( relation_id : int, best_model_path : str ):
     return model
 
 def tune_model( best_model_path_1 : str, best_model_path_2 : str, best_model_path_3 : str ):
-    ray.init( num_cpus=1 )
+    ray.init( num_cpus=2 )
     dataset = ray.put( Ml1mDataset( -1 ) )
     best_model1 = ray.put( load_model( 0, best_model_path_1 ) )
     best_model2 = ray.put( load_model( 1, best_model_path_2 ) )
@@ -227,8 +232,8 @@ def tune_model( best_model_path_1 : str, best_model_path_2 : str, best_model_pat
     }
 
     scheduler = ASHAScheduler(
-        max_t=1,
-        grace_period=1,
+        max_t=128,
+        grace_period=5,
         reduction_factor=2
     )
 
