@@ -12,7 +12,10 @@ class YelpDataset( Dataset ):
         self.n_users = self.train_adj_mat.shape[0]
         self.n_items = self.train_adj_mat.shape[1]
 
-        self.load_dataset( r )
+        if r == -1:
+            self.relation_dataset = { 'train_mask' : torch.ones( ( self.n_users, self.n_items ) ) }
+        else:
+            self.load_dataset( r )
         self.sampling()
 
     def __len__( self ):
@@ -60,5 +63,5 @@ class YelpDataset( Dataset ):
         self.pos_train, self.neg_train = relation_adj_mat.nonzero(), neg_train
 
 if __name__ == '__main__':
-    dataset = YelpDataset( 0 )
+    dataset = YelpDataset( -1 )
     print( dataset[256] )
