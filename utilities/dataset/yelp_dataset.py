@@ -9,21 +9,20 @@ random.seed(7)
 
 class YelpDataset( Dataset ):
     def __init__( self ):
-        self.num_samples = 5
         self.UB, self.BCat, self.BCity = self.load_dataset()
         self.BCat, self.BCity = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity )
         self.n_users, self.n_items = self.UB.shape[0], self.UB.shape[1]
 
-        pos_train_interact, pos_val_interact, pos_test_interact = self.train_test_val_split( self.UB )
-        self.filter_cold_start( pos_train_interact, pos_val_interact, pos_test_interact )
+        self.pos_train_interact, pos_val_interact, pos_test_interact = self.train_test_val_split( self.UB )
+        self.filter_cold_start( self.pos_train_interact, pos_val_interact, pos_test_interact )
         self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
         self.sampling()
 
     def __len__( self ):
-        return self.n_users * self.num_samples
+        return self.pos_train_interact.shape[0]
 
     def __getitem__( self, idx ):
-        return self.train_pos_idx[ idx ], self.train_neg_idx[ idx ]
+        return self.pos_train_interact[ idx ], self.train_neg_idx[ idx ]
 
     def get_val( self ):
         return self.val_mask, self.val_score
@@ -124,15 +123,16 @@ class YelpDataset( Dataset ):
         neg_adj_mat = 1 - self.train_adj_mat
         num_samples = torch.sum( self.train_adj_mat, dim=-1 ).tolist()
 
-        pos_item_idx = torch.multinomial( self.train_adj_mat, num_samples=self.num_samples, replacement=True ).reshape( -1, 1 )
-        neg_item_idx = torch.multinomial( neg_adj_mat, num_samples=self.num_samples ).reshape( -1, 1 )
+        neg_idx = torch.zeros( ( 0, 2 ), dtype=torch.long )
+        for uid in range( self.n_users ):
+            neg_item_idx = torch.multinomial( neg_adj_mat[ uid ], num_samples=int( num_samples[uid] ) ).reshape( -1, 1 )
+            user_idx = torch.full( ( int( num_samples[uid] ), 1 ), uid, dtype=torch.long )
+            neg_idx = torch.vstack( ( neg_idx, torch.hstack( ( user_idx, neg_item_idx ) ) ) )
 
-        user_idx = torch.arange( self.n_users ).reshape( -1, 1 ).tile( 1, self.num_samples ).reshape( -1, 1 )
-
-        self.train_pos_idx = torch.hstack( ( user_idx, pos_item_idx ) )
-        self.train_neg_idx = torch.hstack( ( user_idx, neg_item_idx ) )
+        self.train_neg_idx = neg_idx
 
 
 if __name__ == '__main__':
     dataset = YelpDataset()
+    print( len( dataset ) )
     print( dataset[1999] )
