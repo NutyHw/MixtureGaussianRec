@@ -95,6 +95,7 @@ class YelpDataset( Dataset ):
         train_adj_mat = train_adj_mat[ :, item_mask ]
 
         self.train_adj_mat = train_adj_mat
+
         self.pos_train_interact = train_adj_mat.nonzero()
         self.pos_val_interact = self.apply_mask_to_interact( user_mask, item_mask, pos_val_interact )
         self.pos_test_interact = self.apply_mask_to_interact( user_mask, item_mask, pos_test_interact )
@@ -134,5 +135,3 @@ class YelpDataset( Dataset ):
 
 if __name__ == '__main__':
     dataset = YelpDataset()
-    print( len( dataset ) )
-    print( dataset[1999] )
