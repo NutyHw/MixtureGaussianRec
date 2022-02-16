@@ -15,7 +15,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import ray
 from ray import tune
 from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler
+from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
@@ -28,10 +28,11 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.reg_mat = self.dataset.get_reg_mat( config['relation'] )
-        self.model = Model( self.n_users, self.n_items, self.reg_mat.shape[1], config['num_group'], config['num_latent'] )
+        self.model = Model( self.n_users, self.n_items, self.reg_mat.shape[1], config['num_group'], config['num_latent'], config['mean_constraint'], config['sigma_min'], config['sigma_max'] )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='sum' )
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
+        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
+        self.kl_div_loss = nn.KLDivLoss()
 
         self.alpha = config['alpha']
         self.beta = config['beta']
@@ -49,31 +50,18 @@ class ModelTrainer( pl.LightningModule ):
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
         return torch.mean( torch.relu( - ( pos_result1 - neg_result1 + self.config['prediction_margin'] ) * ( pos_result2 - neg_result2 + self.config['transition_margin'] ) ) )
 
-    def normal_regularization( self, dist : torch.Tensor ):
-        mu, sigma = torch.hsplit( dist, 2 )
-        sigma = F.elu( sigma ) + 1
-
-        # mu regularization
-        return torch.mean( torch.sqrt( torch.sum( mu ** 2, dim=-1 ) ) )
-
-    def normal_regularization( self, dist : torch.Tensor ):
-        mu, sigma = torch.hsplit( dist, 2 )
-
-        return 0.5 * torch.sum( (
-            torch.sum( mu ** 2, dim=1 ) +\
-            torch.sum( sigma, dim=1 ) -\
-            self.config['num_latent'] -\
-            torch.log( torch.prod( sigma, dim=-1 ) )
-        ) )
-
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
+        user_mask = torch.sum( true_rating, dim=-1 ) > 0
+        predict_rating = predict_rating[ user_mask ]
+        true_rating = true_rating[ user_mask ]
+
         _, top_k_indices = torch.topk( predict_rating, k=hr_k, dim=1, largest=True )
         hr_score = torch.mean( ( torch.gather( true_rating, dim=1, index=top_k_indices ) > 0 ).to( torch.float ) )
 
         _, top_k_indices = torch.topk( predict_rating, k=recall_k, dim=1, largest=True )
 
-        recall_score = torch.nanmean( 
-            torch.sum( torch.gather( true_rating, dim=1, index = top_k_indices ), dim=-1 ) / 
+        recall_score = torch.mean( 
+            torch.sum( torch.gather( true_rating, dim=1, index = top_k_indices ), dim=1 ) /
             torch.minimum( torch.sum( true_rating, dim=1 ), torch.tensor( [ recall_k ] ) )
         )
 
@@ -98,10 +86,9 @@ class ModelTrainer( pl.LightningModule ):
 
         # regularization loss
         item_idx = torch.unique( input_idx[:,1], sorted=True )
-        category_reg = F.kl_div( res['category_kg'], self.reg_mat[ item_idx ] )
-        normal_loss = self.normal_regularization( res['distribution'][0] ) + self.normal_regularization( res['distribution'][1] )
+        category_reg = self.kl_div_loss( res['category_kg'], self.reg_mat[ item_idx ] )
 
-        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * ( category_reg + normal_loss )
+        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * category_reg
 
         self.log_dict({ 'loss' : loss.item() })
 
@@ -155,8 +142,7 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1, 
-        num_sanity_val_steps=0,
+        max_epochs=256, 
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
@@ -167,10 +153,15 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_10", patience=10, mode="max", min_delta=0.01)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-5)
         ],
         progress_bar_refresh_rate=0
     )
+
+    if checkpoint_dir:
+        config["resume_from_checkpoint"] = os.path.join(
+            checkpoint_dir, "checkpoint"
+        )
 
     model = ModelTrainer( config, dataset )
 
@@ -181,7 +172,6 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
     trainer = pl.Trainer()
     result = trainer.test( model )
-    print( result )
 
     save_json = {
         'checkpoint_dir' : str( checkpoint_dir ),
@@ -191,38 +181,50 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def tune_model( relation : str ):
+def tune_population_based( relation : str ):
     ray.init( num_cpus=10 )
     dataset = ray.put( Dataset() )
     config = {
-        # grid search parameter
-        'num_latent' : tune.grid_search([ 8, 16, 32 ]),
-        'num_group' : tune.grid_search([ i for i in range( 2, 22, 2 ) ]),
+        # parameter to find
+        'num_latent' : tune.choice([ 8, 16, 32 ]),
+        'num_group' : tune.choice([ i for i in range( 4, 52, 2 ) ]),
 
         # hopefully will find right parameter
-        'prediction_margin' : tune.choice([ i for i in range( 1, 6 ) ]),
-        'transition_margin' : tune.choice([ 1e-3, 5e-3, 1e-2, 5e-2, 1e-1 ]),
-        'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        'batch_size' : tune.choice([ 32, 64, 128, 256, 512 ]),
-        'lr' : tune.quniform( 1e-3, 1e-2, 1e-3 ),
-        'alpha' : tune.quniform( 10, 200, 10 ),
-        'beta' : tune.qrandint( 10, 100, 10 ),
-        'min_lambda' : tune.quniform( 0.6, 0.8, 1e-2 ),
-        'lambda' : tune.quniform(0.85,0.99,1e-2),
+        'prediction_margin' : 1,
+        'transition_margin' : 1e-2,
+        'gamma' : 1e-3,
+        'lr' : 1e-3,
+        'alpha' : 100,
+        'beta' : 100,
+        'min_lambda' : 0.6,
+        'lambda' : 0.9,
+
+        # fix parameter
         'relation' : relation,
         'hr_k' : 20,
         'recall_k' : 20,
         'ndcg_k' : 100
     }
 
-    scheduler = ASHAScheduler(
-        max_t=256,
-        grace_period=10,
-        reduction_factor=2
+    scheduler = PopulationBasedTraining(
+        hyperparam_mutations={
+            'prediction_margin' : tune.uniform( 1, 5 ),
+            'transition_margin' : tune.uniform( 0.01, 0.5 ),
+            'gamma' : [ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ],
+            'batch_size' : [ 32, 64, 128, 256, 512 ],
+            'lr' : tune.loguniform( 1e-4, 1e-1 ),
+            'alpha' : tune.uniform( 10, 100 ),
+            'beta' : tune.uniform( 10, 100 ),
+            'min_lambda' : tune.uniform( 0.5, 0.8 ),
+            'lambda' : tune.uniform( 0.8, 0.99 ),
+            'mean_constraint' : tune.uniform( 2, 100 ),
+            'sigma_min' : tune.uniform( 0.01, 0.1 ),
+            'sigma_max' : tune.uniform( 5, 20 )
+        }
     )
 
     reporter = CLIReporter( 
-        parameter_columns=[ 'num_latent', 'gamma', 'num_group' ],
+        parameter_columns=[ 'prediction_margin', 'transition_margin', 'gamma', 'batch_size', 'lr', 'alpha', 'beta', 'min_lambda', 'lambda' ],
         metric_columns=[ 'hr_score', 'recall_score', 'ndcg_score'  ]
     )
 
@@ -231,17 +233,16 @@ def tune_model( relation : str ):
         resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=5,
+        num_samples=100,
         verbose=1,
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,
         name=f'yelp_dataset_{relation}',
         local_dir=f"/data2/saito/yelp_relation_{relation}",
-        keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_model( 'BCat' )
+    tune_population_based( 'BCat' )
