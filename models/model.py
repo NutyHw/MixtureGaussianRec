@@ -75,9 +75,6 @@ class Model( nn.Module ):
             item_k = torch.softmax( self.embedding['item_embedding'], dim=-1 )
             transition = self.compute_weight( self.compute_gaussian_expected_likehood( group_prob, category_prob ) )
 
-            print(f'user_k is nan : { user_k.isnan().any() }')
-            print(f'item_k is nan : { item_k.isnan().any() }')
-            print(f'transition is nan : { transition.isnan().any() }')
             return torch.linalg.multi_dot( ( user_k, transition, item_k.T ) )
 
         unique_item_idx, item_indices = torch.unique( item_idx, return_inverse=True, sorted=True )
@@ -86,7 +83,6 @@ class Model( nn.Module ):
         item_k = torch.softmax( self.embedding['item_embedding'][ unique_item_idx ], dim=-1 )
 
         transition = self.compute_weight( self.compute_gaussian_expected_likehood( group_prob, category_prob ) )
-        print( transition.isnan().any() )
         kl_div = self.compute_mixture_gaussian_expected_likehood( user_k[ user_indices ], item_k[ item_indices ], group_prob, category_prob )
 
         return {
