@@ -11,9 +11,8 @@ class Ml1mPreprocess():
         self.interaction_file = os.path.join( dataset_dir, 'ratings.dat' )
 
         self.adj_mat = self.load_cf()
-        self.val_interact, self.test_interact, self.train_mask = self.train_test_val_split( self.adj_mat )
         self.item_genre, self.user_age, self.user_jobs = self.load_kg()
-        self.adj_mat = ( self.adj_mat > 0 ).to( torch.int )
+        self.train_mask, self.val_mask, self.test_mask = self.train_test_val_split()
 
         self.save_process_data( save_dataset_dir )
 
@@ -25,17 +24,15 @@ class Ml1mPreprocess():
         os.mkdir( process_dir )
         os.chdir( process_dir )
 
-        torch.save( self.val_interact, 'val_dataset.pt' )
-        torch.save( self.test_interact, 'test_dataset.pt' )
-        torch.save( self.adj_mat, 'train_adj_mat.pt' )
+        torch.save( self.adj_mat, 'adj_mat.pt' )
         torch.save( self.train_mask, 'train_mask.pt' )
-
-        os.mkdir( os.path.join( process_dir, 'relation_mat' ) )
-        os.chdir( os.path.join( process_dir, 'relation_mat' ) )
-
-        for r in range( 3 ):
-            os.mkdir( str( r ) )
-            torch.save( self.item_genre, os.path.join( str(r), f'interact.pt' ) )
+        torch.save( self.val_mask, 'val_mask.pt' )
+        torch.save( self.test_mask, 'test_mask.pt' )
+        torch.save( { 
+            'item_genre' : self.item_genre,
+            'user_age' : self.user_age,
+            'user_jobs' : self.user_jobs
+        }, 'interact.pt' )
 
     def load_cf( self ):
         '''
@@ -44,9 +41,9 @@ class Ml1mPreprocess():
         adj_mat = torch.zeros( ( self.n_users, self.n_items ) )
         with open( self.interaction_file, 'r', encoding='iso-8859-1' ) as f:
             for line in f:
-                user_id, item_id, _, timestamps = line.split('::')
-                user_id, item_id, timestamps = int( user_id ) - 1, int( item_id ) - 1, int( timestamps )
-                adj_mat[ user_id, item_id ] = timestamps
+                user_id, item_id, _, _ = line.split('::')
+                user_id, item_id = int( user_id ) - 1, int( item_id ) - 1
+                adj_mat[ user_id, item_id ] = 1
 
         return adj_mat
 
@@ -128,30 +125,25 @@ class Ml1mPreprocess():
 
         return item_genre, user_age, user_jobs
 
-    def leave_one_out( self, interaction_adj_mat : torch.Tensor, mask : torch.Tensor ):
-        _, val_test_items = torch.topk( interaction_adj_mat * mask, 2 )
-        neg_val_test_items = torch.multinomial( ( 1 - ( interaction_adj_mat > 0 ).to( torch.int ) ) * mask, num_samples=200 )
-
-        pos_val_items, pos_test_items = torch.hsplit( val_test_items, sections=2 )
-        neg_val_items, neg_test_items = torch.hsplit( neg_val_test_items, sections=2 )
-
-        val_items = torch.hstack( ( pos_val_items, neg_val_items ) ).reshape( -1, 1 )
-        test_items = torch.hstack( ( pos_test_items, neg_test_items ) ).reshape( -1, 1 )
-
-        user_ids = torch.arange( self.n_users ).reshape( -1, 1 ).tile( 1, 101 ).reshape( -1, 1 )
-
-        return torch.hstack( ( user_ids, val_items ) ), torch.hstack( ( user_ids, test_items ) )
-
-    def train_test_val_split( self, adj_mat ):
-        # perform leave one out validation
-        val_interact, test_interact = self.leave_one_out( adj_mat, torch.ones( ( self.n_users, self.n_items ) ) )
-
-        # remove validation interaction and test interaction from train adj_mat
+    def train_test_val_split( self ):
         train_mask = torch.ones( ( self.n_users, self.n_items ) )
-        train_mask[ val_interact[:,0], val_interact[:,1] ] = 0
-        train_mask[ test_interact[:,0], test_interact[:,1] ] = 0
+        val_mask = torch.zeros( ( self.n_users, self.n_items ) )
+        test_mask = torch.zeros( ( self.n_users, self.n_items ) )
 
-        return val_interact, test_interact, train_mask
+        val_test_samples = ( torch.sum( self.adj_mat, dim=-1 ) * 0.2 ).to( torch.int ).tolist()
+
+        for user in range( self.n_users ):
+            val_item_idx = torch.multinomial( self.adj_mat[ user ], num_samples=val_test_samples[ user ] )
+            train_mask[ user, val_item_idx ] = 0
+            val_mask[ user, val_item_idx ] = 1
+            test_item_idx = torch.multinomial( self.adj_mat[ user ] * train_mask[ user ], num_samples=val_test_samples[ user ] )
+            train_mask[ user, test_item_idx ] = 0
+            test_mask[ user, test_item_idx ] = 1
+
+        val_mask[ self.adj_mat == 0 ] = 1
+        test_mask[ self.adj_mat == 0 ] = 1
+
+        return train_mask, val_mask, test_mask
 
 if __name__ == '__main__':
     ml1m_path = '../../datasets/ml-1m/'
