@@ -3,64 +3,67 @@ import torch
 from torch.utils.data import Dataset
 
 class Ml1mDataset( Dataset ):
-    def __init__( self, r : int ):
-        dataset_dir = './process_datasets/ml-1m/'
-        self.relation_dir = os.path.join( dataset_dir, 'relation_mat' )
-        self.val_dataset = torch.load( os.path.join( dataset_dir, 'val_dataset.pt' ) )
-        self.test_dataset = torch.load( os.path.join( dataset_dir, 'test_dataset.pt' ) )
-        self.train_adj_mat = torch.load( os.path.join( dataset_dir, 'train_adj_mat.pt' ) )
-        self.train_mask = torch.load( os.path.join( dataset_dir, 'train_mask.pt' ) )
+    def __init__( self ):
+        self.dataset_dir = './process_datasets/ml-1m/'
 
-        self.n_users = self.train_adj_mat.shape[0]
-        self.n_items = self.train_adj_mat.shape[1]
+        self.load_dataset()
 
-        if r > -1:
-            self.load_dataset( r )
-        else:
-            self.interact_mapper = torch.zeros( ( 1, 1 ) )
+        self.n_users, self.n_items = self.adj_mat.shape
+        self.sub_sampling()
         self.sampling()
 
+
     def __len__( self ):
-        return self.pos_train.shape[0]
+        return self.pos_train_data.shape[0]
 
     def __getitem__( self, idx ):
-        return self.pos_train[ idx ], self.neg_train[ idx ]
+        return self.pos_train_data[ idx ], self.neg_train_data[ idx ] 
 
     def get_val( self ):
-        return self.val_dataset
+        return self.val_mask, self.adj_mat * self.val_mask
 
     def get_test( self ):
-        return self.test_dataset
+        return self.test_mask, self.adj_mat * self.test_mask
 
-    def get_reg_mat( self ):
-        return self.interact_mapper
+    def get_reg_mat( self, relation : str ):
+        return self.interact[ relation ]
 
-    def load_dataset( self, r ):
-        if r == -1:
-            self.interact_mapper = torch.ones( ( self.n_users, self.n_items ) )
-        interact_mapper = torch.load( os.path.join( self.relation_dir, str(r), 'interact.pt' ) )
+    def load_dataset( self ):
+        self.adj_mat = torch.load( os.path.join( self.dataset_dir, 'adj_mat.pt' ) )
+        self.train_mask = torch.load( os.path.join( self.dataset_dir, 'train_mask.pt' ) )
+        self.val_mask = torch.load( os.path.join( self.dataset_dir, 'val_mask.pt' ) )
+        self.test_mask = torch.load( os.path.join( self.dataset_dir, 'test_mask.pt' ) )
+        self.interact = torch.load( os.path.join( self.dataset_dir, 'interact.pt' ) )
 
-        self.interact_mapper = interact_mapper
+    def sub_sampling( self ):
+        pos_adj_mat = self.adj_mat * self.train_mask
+        neg_adj_mat = 1 - ( self.adj_mat * self.train_mask )
+
+        pos_item_prob = torch.sum( pos_adj_mat, dim=0 ) / self.n_users
+        neg_item_prob = torch.sum( neg_adj_mat, dim=0 ) / self.n_users
+
+        norm_pos_item_prob = ( torch.sqrt( pos_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / pos_item_prob )
+        norm_neg_item_prob = ( torch.sqrt( neg_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / neg_item_prob )
+
+        self.prob_pos_items = norm_pos_item_prob
+        self.prob_neg_items = norm_neg_item_prob
 
     def sampling( self ):
-        relation_adj_mat = self.train_adj_mat * self.train_mask
-        relation_neg_adj_mat = ( 1 - self.train_adj_mat ) * self.train_mask
+        prob = torch.FloatTensor( self.n_items ).normal_(0, 1)
+        pos_item_mask = self.prob_pos_items > prob
+        neg_item_mask = self.prob_neg_items > prob
 
-        user_mask = torch.sum( relation_adj_mat, dim=-1 ) > 0
+        pos_adj_mat = ( self.adj_mat * self.train_mask ) * pos_item_mask
+        neg_adj_mat = ( 1 - ( self.adj_mat * self.train_mask ) ) * neg_item_mask
 
-        num_samples = torch.sum( relation_adj_mat, dim=-1 ).tolist()
-        neg_train = torch.zeros( ( 0, 2 ), dtype=torch.long )
+        user_mask = torch.sum( pos_adj_mat, dim=-1 ) > 0
 
-        for uid in torch.arange( self.train_adj_mat.shape[0] )[ user_mask ].tolist():
-            neg_items = torch.multinomial( relation_neg_adj_mat[ uid ], num_samples=int( num_samples[ uid ] ), replacement=True ).reshape( -1, 1 )
-            user_idx = torch.full( ( int( num_samples[ uid ] ), 1 ), uid, dtype=torch.long )
-            neg_train = torch.vstack( ( neg_train, torch.hstack( ( user_idx, neg_items ) ) ) )
+        pos_items = torch.multinomial( pos_adj_mat[ user_mask ], num_samples=1 )
+        neg_items = torch.multinomial( neg_adj_mat[ user_mask ], num_samples=1 )
+        user_idx = torch.arange( self.n_users )[ user_mask ].reshape( -1, 1 )
 
-        self.pos_train, self.neg_train = relation_adj_mat.nonzero(), neg_train
+        self.pos_train_data = torch.hstack( ( user_idx, pos_items ) )
+        self.neg_train_data = torch.hstack( ( user_idx, neg_items ) )
 
 if __name__ == '__main__':
-    dataset = Ml1mDataset( 2 )
-    print( dataset.get_reg_mat().shape )
-    print( dataset.n_users )
-    # print( dataset.get_reg_mat().shape )
-    # print( dataset[256] )
+    dataset = Ml1mDataset()
