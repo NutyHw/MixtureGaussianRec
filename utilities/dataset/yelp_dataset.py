@@ -9,6 +9,7 @@ random.seed(7)
 
 class YelpDataset( Dataset ):
     def __init__( self ):
+        self.sample_size = 5
         self.UB, self.BCat, self.BCity = self.load_dataset()
         self.BCat, self.BCity = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity )
         self.n_users, self.n_items = self.UB.shape[0], self.UB.shape[1]
@@ -16,13 +17,15 @@ class YelpDataset( Dataset ):
         self.pos_train_interact, pos_val_interact, pos_test_interact = self.train_test_val_split( self.UB )
         self.filter_cold_start( self.pos_train_interact, pos_val_interact, pos_test_interact )
         self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
+
+        self.sub_sampling()
         self.sampling()
 
     def __len__( self ):
-        return self.pos_train_interact.shape[0]
+        return self.pos_train_data.shape[0]
 
     def __getitem__( self, idx ):
-        return self.pos_train_interact[ idx ], self.train_neg_idx[ idx ]
+        return self.pos_train_data[ idx ], self.neg_train_data[ idx ] 
 
     def get_val( self ):
         return self.val_mask, self.val_score
@@ -120,18 +123,36 @@ class YelpDataset( Dataset ):
 
         return val_mask > 0, val_scores, test_mask > 0, test_scores
 
-    def sampling( self ):
+    def sub_sampling( self ):
+        pos_adj_mat = self.train_adj_mat
         neg_adj_mat = 1 - self.train_adj_mat
-        num_samples = torch.sum( self.train_adj_mat, dim=-1 ).tolist()
 
-        neg_idx = torch.zeros( ( 0, 2 ), dtype=torch.long )
-        for uid in range( self.n_users ):
-            neg_item_idx = torch.multinomial( neg_adj_mat[ uid ], num_samples=int( num_samples[uid] ) ).reshape( -1, 1 )
-            user_idx = torch.full( ( int( num_samples[uid] ), 1 ), uid, dtype=torch.long )
-            neg_idx = torch.vstack( ( neg_idx, torch.hstack( ( user_idx, neg_item_idx ) ) ) )
+        pos_item_prob = torch.sum( pos_adj_mat, dim=0 ) / self.n_users
+        neg_item_prob = torch.sum( neg_adj_mat, dim=0 ) / self.n_users
 
-        self.train_neg_idx = neg_idx
+        norm_pos_item_prob = ( torch.sqrt( pos_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / pos_item_prob )
+        norm_neg_item_prob = ( torch.sqrt( neg_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / neg_item_prob )
 
+        self.prob_pos_items = pos_adj_mat * norm_pos_item_prob
+        self.prob_neg_items = neg_adj_mat * norm_neg_item_prob
 
+    def sampling( self ):
+        prob = torch.FloatTensor( self.n_items ).normal_(0, 1)
+        pos_item_mask = self.prob_pos_items > prob
+        neg_item_mask = self.prob_neg_items > prob
+        
+        pos_adj_mat = self.train_adj_mat * pos_item_mask
+        neg_adj_mat = ( 1 - self.train_adj_mat ) * neg_item_mask
+
+        user_mask = torch.sum( pos_adj_mat, dim=-1 ) > 0
+
+        pos_items = torch.multinomial( pos_adj_mat[ user_mask ], num_samples=1 )
+        neg_items = torch.multinomial( neg_adj_mat[ user_mask ], num_samples=1 )
+        user_idx = torch.arange( self.n_users )[ user_mask ].reshape( -1, 1 )
+
+        self.pos_train_data = torch.hstack( ( user_idx, pos_items ) )
+        self.neg_train_data = torch.hstack( ( user_idx, neg_items ) )
+        
 if __name__ == '__main__':
     dataset = YelpDataset()
+    print( dataset[0] )

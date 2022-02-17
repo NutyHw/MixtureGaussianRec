@@ -1,5 +1,6 @@
 import os
 import json 
+import random
 from functools import partial
 
 import torch
@@ -15,11 +16,15 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import ray
 from ray import tune
 from ray.tune import CLIReporter
-from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.suggest import ConcurrencyLimiter
+from ray.tune.suggest.bayesopt import BayesOptSearch
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
+
+random.seed()
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
@@ -28,7 +33,7 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.reg_mat = self.dataset.get_reg_mat( config['relation'] )
-        self.model = Model( self.n_users, self.n_items, self.reg_mat.shape[1], config['num_group'], config['num_latent'], config['mean_constraint'], config['sigma_min'], config['sigma_max'] )
+        self.model = Model( self.n_users, self.n_items, self.reg_mat.shape[1], int( round( config['num_group'] ) ), config['num_latent'], config['mean_constraint'], config['sigma_min'], config['sigma_max'] )
 
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
         self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
@@ -39,13 +44,13 @@ class ModelTrainer( pl.LightningModule ):
         self.gamma = config['gamma']
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=1 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=16 )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
 
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
         return torch.mean( torch.relu( - ( pos_result1 - neg_result1 + self.config['prediction_margin'] ) * ( pos_result2 - neg_result2 + self.config['transition_margin'] ) ) )
@@ -56,7 +61,7 @@ class ModelTrainer( pl.LightningModule ):
         true_rating = true_rating[ user_mask ]
 
         _, top_k_indices = torch.topk( predict_rating, k=hr_k, dim=1, largest=True )
-        hr_score = torch.mean( ( torch.gather( true_rating, dim=1, index=top_k_indices ) > 0 ).to( torch.float ) )
+        hr_score = torch.mean( ( torch.sum( torch.gather( true_rating, dim=1, index=top_k_indices ), dim=-1 ) > 0 ).to( torch.float ) )
 
         _, top_k_indices = torch.topk( predict_rating, k=recall_k, dim=1, largest=True )
 
@@ -143,6 +148,7 @@ class ModelTrainer( pl.LightningModule ):
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         max_epochs=256, 
+        num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
@@ -153,7 +159,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-5)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
         ],
         progress_bar_refresh_rate=0
     )
@@ -182,22 +188,26 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=10 )
+    ray.init( num_cpus=16,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Dataset() )
     config = {
         # parameter to find
-        'num_latent' : tune.choice([ 8, 16, 32 ]),
-        'num_group' : tune.choice([ i for i in range( 4, 52, 2 ) ]),
+        'num_latent' : 16,
+        'batch_size' : 32,
 
         # hopefully will find right parameter
-        'prediction_margin' : 1,
-        'transition_margin' : 1e-2,
-        'gamma' : 1e-3,
-        'lr' : 1e-3,
-        'alpha' : 100,
-        'beta' : 100,
-        'min_lambda' : 0.6,
-        'lambda' : 0.9,
+        'num_group' : tune.uniform(4,51),
+        'prediction_margin' : tune.uniform( 1, 5 ),
+        'transition_margin' : tune.uniform( 0.01, 0.5 ),
+        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'lr' : tune.loguniform( 1e-4, 1e-1 ),
+        'alpha' : tune.uniform( 10, 100 ),
+        'beta' : tune.uniform( 10, 100 ),
+        'min_lambda' : tune.uniform( 0.5, 0.8 ),
+        'lambda' : tune.uniform( 0.8, 0.99 ),
+        'mean_constraint' : tune.uniform( 2, 100 ),
+        'sigma_min' : tune.uniform( 0.1, 0.5 ),
+        'sigma_max' : tune.uniform( 5, 20 ),
 
         # fix parameter
         'relation' : relation,
@@ -206,26 +216,17 @@ def tune_population_based( relation : str ):
         'ndcg_k' : 100
     }
 
-    scheduler = PopulationBasedTraining(
-        hyperparam_mutations={
-            'prediction_margin' : tune.uniform( 1, 5 ),
-            'transition_margin' : tune.uniform( 0.01, 0.5 ),
-            'gamma' : [ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ],
-            'batch_size' : [ 32, 64, 128, 256, 512 ],
-            'lr' : tune.loguniform( 1e-4, 1e-1 ),
-            'alpha' : tune.uniform( 10, 100 ),
-            'beta' : tune.uniform( 10, 100 ),
-            'min_lambda' : tune.uniform( 0.5, 0.8 ),
-            'lambda' : tune.uniform( 0.8, 0.99 ),
-            'mean_constraint' : tune.uniform( 2, 100 ),
-            'sigma_min' : tune.uniform( 0.01, 0.1 ),
-            'sigma_max' : tune.uniform( 5, 20 )
-        }
+    algo = BayesOptSearch()
+    algo = ConcurrencyLimiter(algo, max_concurrent=50)
+
+    scheduler = ASHAScheduler(
+        grace_period=1,
+        reduction_factor=5
     )
 
     reporter = CLIReporter( 
-        parameter_columns=[ 'prediction_margin', 'transition_margin', 'gamma', 'batch_size', 'lr', 'alpha', 'beta', 'min_lambda', 'lambda' ],
-        metric_columns=[ 'hr_score', 'recall_score', 'ndcg_score'  ]
+        parameter_columns=[ 'num_latent', 'num_group', 'gamma' ],
+        metric_columns=[ 'hr_score', 'recall_score', 'ndcg_score', 'loss' ]
     )
 
     analysis = tune.run( 
@@ -233,14 +234,16 @@ def tune_population_based( relation : str ):
         resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=100,
+        num_samples=200,
         verbose=1,
         config=config,
         progress_reporter=reporter,
         scheduler=scheduler,
-        name=f'yelp_dataset_{relation}',
-        local_dir=f"/data2/saito/yelp_relation_{relation}",
-        checkpoint_score_attr='ndcg_score'
+        search_alg=algo,
+        name=f'yelp_dataset_{relation}_population',
+        keep_checkpoints_num=2,
+        local_dir=f"/data2/saito/",
+        checkpoint_score_attr='ndcg_score',
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
