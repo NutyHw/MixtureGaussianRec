@@ -53,7 +53,7 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
 
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 + self.config['prediction_margin'] ) * ( pos_result2 - neg_result2 + self.config['transition_margin'] ) ) )
+        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -188,7 +188,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=16,  _temp_dir='/data2/saito/ray_tmp/' )
+    ray.init( num_cpus=10,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Dataset() )
     config = {
         # parameter to find
@@ -196,9 +196,9 @@ def tune_population_based( relation : str ):
         'batch_size' : 32,
 
         # hopefully will find right parameter
-        'num_group' : tune.uniform(4,51),
         'prediction_margin' : tune.uniform( 1, 5 ),
         'transition_margin' : tune.uniform( 0.01, 0.5 ),
+        'num_group' : tune.uniform(4,51),
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
         'lr' : tune.loguniform( 1e-4, 1e-1 ),
         'alpha' : tune.uniform( 10, 100 ),
@@ -220,8 +220,8 @@ def tune_population_based( relation : str ):
     algo = ConcurrencyLimiter(algo, max_concurrent=50)
 
     scheduler = ASHAScheduler(
-        grace_period=1,
-        reduction_factor=5
+        grace_period=10,
+        reduction_factor=2
     )
 
     reporter = CLIReporter( 
