@@ -133,8 +133,8 @@ class YelpDataset( Dataset ):
         norm_pos_item_prob = ( torch.sqrt( pos_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / pos_item_prob )
         norm_neg_item_prob = ( torch.sqrt( neg_item_prob / 1e-3 ) + 1 ) * ( 1e-3 / neg_item_prob )
 
-        self.prob_pos_items = pos_adj_mat * norm_pos_item_prob
-        self.prob_neg_items = neg_adj_mat * norm_neg_item_prob
+        self.prob_pos_items = norm_pos_item_prob
+        self.prob_neg_items = norm_neg_item_prob
 
     def sampling( self ):
         prob = torch.FloatTensor( self.n_items ).normal_(0, 1)
