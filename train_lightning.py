@@ -99,10 +99,6 @@ class ModelTrainer( pl.LightningModule ):
 
         return loss
 
-    def on_train_epoch_end( self ):
-        self.alpha = max( self.alpha * self.config['lambda'], self.config['alpha'] * self.config['min_lambda'] )
-        self.beta = max( self.beta * self.config['lambda'], self.config['beta'] * self.config['min_lambda'] )
-
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
@@ -203,8 +199,6 @@ def tune_population_based( relation : str ):
         'lr' : tune.loguniform( 1e-4, 1e-1 ),
         'alpha' : tune.uniform( 10, 100 ),
         'beta' : tune.uniform( 10, 100 ),
-        'min_lambda' : tune.uniform( 0.5, 0.8 ),
-        'lambda' : tune.uniform( 0.8, 0.99 ),
         'mean_constraint' : tune.uniform( 2, 100 ),
         'sigma_min' : tune.uniform( 0.1, 0.5 ),
         'sigma_max' : tune.uniform( 5, 20 ),
@@ -248,4 +242,4 @@ def tune_population_based( relation : str ):
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( 'BCat' )
+    tune_population_based( 'BCity' )
