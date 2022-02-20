@@ -8,9 +8,9 @@ class BPR(nn.Module):
         self.H = nn.Parameter(torch.normal( 0, 1, ( item_size, dim ) ) )
 
     def forward(self, user_idx : torch.Tensor, item_idx : torch.Tensor ):
-        user_embed = self.W[user_idx, :]
-        item_embed = self.H[item_idx, :]
+        user_embed = self.W[ user_idx ]
+        item_embed = self.H[ item_idx ]
 
-        y = torch.mul(user_embed, item_embed).sum(dim=1).reshape( -1, 1 )
+        y = torch.sum( self.W * self.H, dim=-1 )
 
         return y
