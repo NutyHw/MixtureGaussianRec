@@ -4,24 +4,24 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 class Model( nn.Module ):
-    def __init__( self, num_user : int, num_item : int, num_category : int, num_group : int, num_latent : int, mean_constraint : float, sigma_min : float, sigma_max : float ):
+    def __init__( self, **kwargs ):
         super( Model, self ).__init__()
-        self.num_latent = num_latent
-        self.mean_constraint = mean_constraint
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
+        self.num_latent = kwargs['num_latent']
+        self.mean_constraint = kwargs['mean_constraint']
+        self.sigma_min = kwargs['sigma_min']
+        self.sigma_max = kwargs['sigma_max']
         self.eps = 1e-9
 
         self.embedding = nn.ParameterDict({
-            'user_embedding' : nn.Parameter( torch.normal( 0, 1, ( num_user, num_group ) ) ),
-            'item_embedding' : nn.Parameter( torch.normal( 0, 1, ( num_item, num_category ) ) ),
-            'group_mu' : nn.Parameter( torch.normal( 0, 1,( num_group, num_latent ) ) ),
-            'group_log_sigma' : nn.Parameter( torch.normal( 0, 1,( num_group, num_latent ) ) ),
-            'category_mu' : nn.Parameter( torch.normal( 0, 1,( num_category, num_latent ) ) ),
-            'category_log_sigma' : nn.Parameter( torch.normal( 0, 1,( num_category, num_latent ) ) ),
+            'user_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_group'] ) ) ),
+            'item_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) ),
+            'group_mu' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_group'], kwargs['num_latent'] ) ) ),
+            'group_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_group'], kwargs['num_latent'] ) ) ),
+            'category_mu' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
+            'category_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
         })
 
-        self.transition_weight = nn.Linear( num_category, num_category, bias=True )
+        self.transition_weight = nn.Linear( kwargs['num_category'], kwargs['num_category'], bias=True )
 
     def prob_encoder( self ):
         return torch.hstack( ( self.embedding['group_mu'], torch.exp( self.embedding['group_log_sigma'] ) ) ),\
