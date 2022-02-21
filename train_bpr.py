@@ -23,6 +23,7 @@ from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
+        self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.config = config
         self.dataset = dataset
@@ -30,13 +31,13 @@ class ModelTrainer( pl.LightningModule ):
         self.model = BPR( self.n_users, self.n_items, config['num_latent'] )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=1 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=16 )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( 1 ).reshape( -1, 1 ) ), batch_size=1, shuffle=False, num_workers=16 )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( 1 ).reshape( -1, 1 ) ), batch_size=1, shuffle=False, num_workers=16 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -71,19 +72,12 @@ class ModelTrainer( pl.LightningModule ):
 
         return loss
 
-    def on_validation_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
-
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
-
-    def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
+        y_pred = self.model( None, None, is_test=True )
+        y_pred[ ~val_mask ] = 0
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -91,19 +85,12 @@ class ModelTrainer( pl.LightningModule ):
             'ndcg_score' : ndcg_score
         })
 
-    def on_test_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
-
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
-
-    def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        y_pred = self.model( None, None, is_test=True )
+        y_pred[ ~test_mask ] = 0
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -112,24 +99,24 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=128, 
+        max_epochs=1, 
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
-                'hr_1' : 'hr_1',
-                'recall_10' : 'recall_10',
-                'ndcg_10' : 'ndcg_10'
+                'hr_k' : 'hr_k',
+                'recall_k' : 'recall_k',
+                'ndcg_k' : 'ndcg_k'
             },
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_10", patience=10, mode="max", min_delta=0.01)
+           EarlyStopping(monitor="ndcg_k", patience=10, mode="max", min_delta=0.01)
         ],
         progress_bar_refresh_rate=0
     )
@@ -153,13 +140,13 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=14 )
-    dataset = ray.put( YelpDataset() )
+    ray.init( num_cpus=1 )
+    dataset = YelpDataset()
+    dataset = ray.put( dataset )
     config = {
         # grid search parameter
         'num_latent' : 16,
         'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        'num_group' : tune.qrandint( 5, 50, 5 ),
 
         # hopefully will find right parameter
         'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
@@ -171,22 +158,22 @@ def tune_model():
     }
 
     scheduler = ASHAScheduler(
-        max_t=256,
-        grace_period=10,
+        max_t=1,
+        grace_period=1,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_k',
         mode='max',
-        num_samples=200,
+        num_samples=2,
         verbose=1,
         config=config,
         scheduler=scheduler,
         name=f'yelp_bpr',
-        local_dir="/data2/saito/",
+        local_dir=".",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_k'
     )
