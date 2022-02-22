@@ -26,6 +26,7 @@ class ModelTrainer( pl.LightningModule ):
         super().__init__()
         self.dataset_dir = '/Users/nuty/Desktop/class/final_project/MixtureGaussianRec/process_datasets/yelp/'
         self.load_dataset()
+        self.normalize()
         self.config = config
         self.n_users, self.n_items = self.train_adj_mat.shape[0], self.train_adj_mat.shape[1]
 
@@ -35,6 +36,10 @@ class ModelTrainer( pl.LightningModule ):
         self.train_adj_mat = torch.load( os.path.join( self.dataset_dir, 'train_adj_mat.pt' ) )
         self.val_dataset = torch.load( os.path.join( self.dataset_dir, 'val_data.pt' ) )
         self.test_dataset = torch.load( os.path.join( self.dataset_dir, 'test_data.pt' ) )
+
+    def normalize( self ):
+        row_norm = 1 / torch.sqrt( torch.sum( self.train_adj_mat, dim=1 ) ).reshape( -1, 1 )
+        self.train_adj_mat = self.train_adj_mat * row_norm
 
     def train_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], num_workers=16 )
