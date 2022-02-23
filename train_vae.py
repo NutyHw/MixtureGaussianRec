@@ -24,7 +24,7 @@ from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict ):
         super().__init__()
-        self.dataset_dir = '/Users/nuty/Desktop/class/final_project/MixtureGaussianRec/process_datasets/yelp/'
+        self.dataset_dir = '/home/saito/MixtureGaussianRec/process_datasets/yelp/'
         self.load_dataset()
         self.normalize()
         self.config = config
@@ -42,13 +42,13 @@ class ModelTrainer( pl.LightningModule ):
         self.train_adj_mat = self.train_adj_mat * row_norm
 
     def train_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -129,7 +129,7 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None ):
     trainer = pl.Trainer(
-        max_epochs=1, 
+        max_epochs=256, 
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -164,7 +164,7 @@ def test_model( config : dict, checkpoint_dir : str ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=1 )
+    ray.init( num_cpus=10, _temp_dir='/data2/saito/ray_tmp/'  )
     config = {
         # grid search parameter
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
@@ -180,21 +180,21 @@ def tune_model():
     }
 
     scheduler = ASHAScheduler(
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         train_model,
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=2,
+        num_samples=200,
         verbose=1,
         config=config,
         scheduler=scheduler,
         name=f'yelp_vae',
-        local_dir=".",
+        local_dir="/data2/saito/",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )

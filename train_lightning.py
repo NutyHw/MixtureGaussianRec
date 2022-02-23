@@ -33,7 +33,13 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.reg_mat = self.dataset.get_reg_mat( config['relation'] )
-        self.model = Model( self.n_users, self.n_items, self.reg_mat.shape[1], int( round( config['num_group'] ) ), config['num_latent'], config['mean_constraint'], config['sigma_min'], config['sigma_max'] )
+
+        config['num_user'] = self.n_users
+        config['num_item'] = self.n_items
+        config['num_category'] = self.reg_mat.shape[1]
+        config['num_group'] = int( round( config['num_group'] ) )
+
+        self.model = Model( **config )
 
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
         self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
@@ -184,7 +190,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=10,  _temp_dir='/data2/saito/ray_tmp/' )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Dataset() )
     config = {
         # parameter to find
@@ -218,11 +224,6 @@ def tune_population_based( relation : str ):
         reduction_factor=2
     )
 
-    reporter = CLIReporter( 
-        parameter_columns=[ 'num_latent', 'num_group', 'gamma' ],
-        metric_columns=[ 'hr_score', 'recall_score', 'ndcg_score', 'loss' ]
-    )
-
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
         resources_per_trial={ 'cpu' : 2 },
@@ -231,10 +232,9 @@ def tune_population_based( relation : str ):
         num_samples=200,
         verbose=1,
         config=config,
-        progress_reporter=reporter,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'yelp_dataset_{relation}_population',
+        name=f'yelp_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
