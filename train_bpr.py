@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.bpr import BPR
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.yelp_dataset import YelpDataset
+from utilities.dataset.ml1m_dataset import Ml1mDataset
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -26,7 +26,6 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.config = config
-        self.dataset = dataset
 
         self.model = BPR( self.n_users, self.n_items, config['num_latent'] )
 
@@ -89,6 +88,7 @@ class ModelTrainer( pl.LightningModule ):
         test_mask, true_y = self.dataset.get_test()
         y_pred = self.model( None, None, is_test=True )
         y_pred[ ~test_mask ] = 0
+        torch.save( y_pred, 'bpr_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -98,25 +98,28 @@ class ModelTrainer( pl.LightningModule ):
             'ndcg_score' : ndcg_score
         })
 
+        return y_pred
+
     def configure_optimizers( self ):
         optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1, 
+        max_epochs=256, 
         num_sanity_val_steps=0,
+        limit_train_batches=1,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
-                'hr_k' : 'hr_k',
-                'recall_k' : 'recall_k',
-                'ndcg_k' : 'ndcg_k'
+                'hr_score' : 'hr_score',
+                'recall_score' : 'recall_score',
+                'ndcg_score' : 'ndcg_score'
             },
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_k", patience=10, mode="max", min_delta=0.01)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=0.01)
         ],
         progress_bar_refresh_rate=0
     )
@@ -132,7 +135,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     result = trainer.test( model )
 
     save_json = {
-        'checkpoint_dir' : checkpoint_dir,
+        'checkpoint_dir' : str( checkpoint_dir ),
         'result' : result[0]
     }
 
@@ -140,43 +143,44 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=1 )
-    dataset = YelpDataset()
+    ray.init( num_cpus=10 )
+    dataset = Ml1mDataset()
     dataset = ray.put( dataset )
     config = {
         # grid search parameter
-        'num_latent' : 16,
+        'num_latent' : tune.choice([ 32, 64, 128 ]),
         'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
 
         # hopefully will find right parameter
         'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
         'lr' : tune.quniform( 1e-3, 1e-2, 1e-3 ),
 
-        'hr_k' : 20,
-        'recall_k' : 20,
-        'ndcg_k' : 100
+        'hr_k' : 1,
+        'recall_k' : 10,
+        'ndcg_k' : 10
     }
 
     scheduler = ASHAScheduler(
-        max_t=1,
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
-        metric='ndcg_k',
+        resources_per_trial={ 'cpu' : 2 },
+        metric='ndcg_score',
         mode='max',
-        num_samples=2,
+        num_samples=200,
         verbose=1,
         config=config,
         scheduler=scheduler,
-        name=f'yelp_bpr',
-        local_dir=".",
+        name=f'ml1m_bpr',
+        local_dir="/data2/saito/",
         keep_checkpoints_num=1, 
-        checkpoint_score_attr='ndcg_k'
+        checkpoint_score_attr='ndcg_score'
     )
+
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 
 if __name__ == '__main__':
     tune_model()

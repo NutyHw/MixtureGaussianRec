@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.vae import loss_function, MultiVAE
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.yelp_dataset import YelpDataset
+from utilities.dataset.ml1m_dataset import Ml1mDataset
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -22,15 +22,17 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 class ModelTrainer( pl.LightningModule ):
-    def __init__( self, config : dict ):
+    def __init__( self, config : dict, dataset=None ):
         super().__init__()
-        self.dataset_dir = '/home/saito/MixtureGaussianRec/process_datasets/yelp/'
-        self.load_dataset()
-        self.normalize()
+        self.dataset = ray.get( dataset )
         self.config = config
-        self.n_users, self.n_items = self.train_adj_mat.shape[0], self.train_adj_mat.shape[1]
+        self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
+        self.train_adj_mat = self.dataset.adj_mat * self.dataset.train_mask
 
-        self.model = MultiVAE([ 200, 600, self.n_items ])
+        if config['hidden_layer'] == 1:
+            self.model = MultiVAE([ 200, 600, self.n_items ])
+        elif config['hidden_layer'] == 0:
+            self.model = MultiVAE([ 200, self.n_items ])
 
     def load_dataset( self ):
         self.train_adj_mat = torch.load( os.path.join( self.dataset_dir, 'train_adj_mat.pt' ) )
@@ -91,7 +93,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.vstack( ( self.y_pred, recon_batch ) )
 
     def on_validation_epoch_end( self ):
-        mask, score = self.val_dataset['mask'], self.val_dataset['score']
+        mask, score = self.dataset.get_val()
         self.y_pred[ ~mask ] = - np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( score, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
@@ -112,8 +114,9 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.vstack( ( self.y_pred, recon_batch ) )
 
     def on_test_epoch_end( self ):
-        mask, score = self.test_dataset['mask'], self.test_dataset['score']
+        mask, score = self.dataset.get_test()
         self.y_pred[ ~mask ] = - np.inf
+        torch.save( self.y_pred, 'vae_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( score, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -127,7 +130,7 @@ class ModelTrainer( pl.LightningModule ):
         optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
         return optimizer
 
-def train_model( config, checkpoint_dir=None ):
+def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         max_epochs=256, 
         num_sanity_val_steps=0,
@@ -145,12 +148,13 @@ def train_model( config, checkpoint_dir=None ):
         progress_bar_refresh_rate=0
     )
 
-    model = ModelTrainer( config )
+    model = ModelTrainer( config, dataset=dataset )
 
     trainer.fit( model )
 
-def test_model( config : dict, checkpoint_dir : str ):
-    model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ) )
+
+def test_model( config : dict, checkpoint_dir : str, dataset ):
+    model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ), dataset=dataset )
 
     trainer = pl.Trainer()
     result = trainer.test( model )
@@ -164,40 +168,45 @@ def test_model( config : dict, checkpoint_dir : str ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=10, _temp_dir='/data2/saito/ray_tmp/'  )
+    ray.init( num_cpus=1 )
+    dataset = ray.put( Ml1mDataset() )
     config = {
         # grid search parameter
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
 
         # hopefully will find right parameter
         'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
+        'hidden_layer' : tune.choice([ 0, 1 ]),
         'lr' : tune.uniform( 1e-4, 1e-1 ),
         'anneal' : tune.uniform( 0.1, 0.6 ),
 
-        'hr_k' : 20,
-        'recall_k' : 20,
-        'ndcg_k' : 100
+        'hr_k' : 1,
+        'recall_k' : 10,
+        'ndcg_k' : 10
     }
 
     scheduler = ASHAScheduler(
-        grace_period=10,
+        max_t=1,
+        grace_period=1,
         reduction_factor=2
     )
 
     analysis = tune.run( 
-        train_model,
-        resources_per_trial={ 'cpu' : 2 },
+        partial( train_model, dataset=dataset ),
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_score',
         mode='max',
-        num_samples=200,
+        num_samples=1,
         verbose=1,
         config=config,
         scheduler=scheduler,
         name=f'yelp_vae',
-        local_dir="/data2/saito/",
+        local_dir="./",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )
+
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset=dataset )
 
 if __name__ == '__main__':
     tune_model()
