@@ -1,4 +1,5 @@
 import os
+import sys
 import json 
 from functools import partial
 
@@ -243,5 +244,6 @@ def tune_population_based( relation : str ):
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
+
 if __name__ == '__main__':
-    tune_population_based( 'item_genre' )
+    tune_population_based( sys.argv[1] )
