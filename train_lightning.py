@@ -1,13 +1,13 @@
 import os
 import json 
-import random
 from functools import partial
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import torch.jit as jit
+from torch.utils.data import DataLoader
 from models.model import Model
-from torch.utils.data import DataLoader, TensorDataset
+
 from ndcg import ndcg
 import torch.optim as optim
 import pytorch_lightning as pl
@@ -15,16 +15,12 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 import ray
 from ray import tune
-from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.bayesopt import BayesOptSearch
-from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
-from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.yelp_dataset import YelpDataset as Dataset
-
-random.seed()
+from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
@@ -32,34 +28,38 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
-        self.reg_mat = self.dataset.get_reg_mat( config['relation'] )
+        self.reg_mat = self.dataset.get_reg_mat()
 
         config['num_user'] = self.n_users
         config['num_item'] = self.n_items
         config['num_category'] = self.reg_mat.shape[1]
-        config['num_group'] = int( round( config['num_group'] ) )
+        config['num_group'] = int( round( self.config['num_group'] ) )
 
-        self.model = Model( **config )
-
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
-        self.kl_div_loss = nn.KLDivLoss()
-
-        self.alpha = config['alpha']
-        self.beta = config['beta']
-        self.gamma = config['gamma']
+        model = Model( **config )
+        self.model = jit.trace( model, torch.tensor([ 0, 1 ]) )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], num_workers=16 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
 
-    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
+    def negative_log_likehood( self, energy_res, x_adj, beta ):
+        return torch.sum( energy_res * x_adj, dim=-1 ) \
+            + ( 1 / beta ) * torch.log( torch.sum( torch.exp( - beta * energy_res ), dim=-1 ) )
+
+    def compute_joint_distillation( self, energy_res, transition_prob, beta ):
+        return F.kl_div( 
+            torch.log( torch.softmax( - energy_res * beta, dim=-1 ) ),
+            transition_prob,
+            reduction='batchmean'
+        )
+
+    def compute_cross_entropy( self, predict_prob, true_prob, confidence ):
+        return torch.sum( - true_prob * torch.log( predict_prob ) * confidence, dim=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -81,36 +81,37 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact = batch
-        batch_size = pos_interact.shape[0]
+        user_idx, x_adj, prob_adj = batch
+        norm_x_adj = x_adj / torch.sum( x_adj, dim=-1 ).reshape( -1, 1 )
 
-        input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
-        res = self.model( input_idx[:,0], input_idx[:,1] )
+        mixture_kl_div, transition_prob, regularization, item_embedding = self.model( user_idx )
 
-        pos_res_out, neg_res_out = torch.split( res['out'], split_size_or_sections=batch_size, dim=0 )
-        pos_res_kg_prob, neg_res_kg_prob = torch.split( res['kg_prob'], split_size_or_sections=batch_size, dim=0 )
+        alpha = self.config['alpha'] * self.config['lambda'] ** self.current_epoch
+        beta = self.config['beta'] * self.config['lambda'] ** self.current_epoch
 
-        # prediction loss
-        l1_loss = self.prediction_loss( pos_res_out, neg_res_out, torch.ones( ( batch_size, 1 ) ) )
-        l2_loss = self.transition_loss( pos_res_kg_prob, neg_res_kg_prob, torch.ones( ( batch_size, 1 ) ) )
-        l3_loss = self.joint_loss( pos_res_out, neg_res_out, pos_res_kg_prob, neg_res_kg_prob )
+        # compute loss
+        l1 = torch.mean( self.negative_log_likehood( mixture_kl_div, x_adj, self.config['beta1'] ) )
+        l2 = torch.mean( self.compute_cross_entropy( transition_prob, norm_x_adj, prob_adj * self.config['confidence'] ) )
+        l3 = self.compute_joint_distillation( mixture_kl_div, transition_prob, self.config['beta2'] )
 
-        # regularization loss
-        item_idx = torch.unique( input_idx[:,1], sorted=True )
-        category_reg = self.kl_div_loss( res['category_kg'], self.reg_mat[ item_idx ] )
+        loss = alpha * l1 + beta * l2 + l3
 
-        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * category_reg
+        # regularization
+        norm_regularization = torch.sum( regularization )
+        item_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='sum' )
 
-        self.log_dict({ 'loss' : loss.item() })
+        reg_loss = self.config['gamma'] * ( norm_regularization + item_regularization )
 
-        return loss
+        return loss + reg_loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx, _, _ = batch
+        mixture_kl_div, _, _, _ = self.model( user_idx )
+
+        self.y_pred = torch.vstack( ( self.y_pred, - mixture_kl_div ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -128,12 +129,15 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx, x_adj, prob_adj = batch
+        mixture_kl_div, _, _, _ = self.model( user_idx )
+
+        self.y_pred = torch.vstack( ( self.y_pred, - mixture_kl_div ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
         self.y_pred[ ~test_mask ] = 0
+        torch.save( self.y_pred, f'{self.config["relation"]}_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -144,7 +148,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -152,7 +156,6 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
         max_epochs=256, 
         num_sanity_val_steps=0,
         callbacks=[
-            Scheduler(),
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
                 'recall_score' : 'recall_score',
@@ -161,7 +164,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -190,30 +193,29 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset() )
+    ray.init( num_cpus=8, _temp_dir='/data2/saito/ray_tmp/' )
+    dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
-        'num_latent' : 16,
-        'batch_size' : 32,
+        'num_latent' : 64,
+        'batch_size' : 256,
 
         # hopefully will find right parameter
-        'prediction_margin' : tune.uniform( 1, 5 ),
-        'transition_margin' : tune.uniform( 0.01, 0.5 ),
         'num_group' : tune.uniform(4,51),
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
-        'lr' : tune.loguniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 10, 100 ),
-        'beta' : tune.uniform( 10, 100 ),
-        'mean_constraint' : tune.uniform( 2, 100 ),
-        'sigma_min' : tune.uniform( 0.1, 0.5 ),
-        'sigma_max' : tune.uniform( 5, 20 ),
+        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'alpha' : tune.uniform( 1, 10 ),
+        'beta' : tune.uniform( 1, 10 ),
+        'beta1' : tune.uniform( 1e-2, 10 ),
+        'beta2' : tune.uniform( 1e-2, 10 ),
+        'lambda' : tune.uniform( 0, 1 ),
+        'confidence' : tune.uniform( 10, 100 ),
 
         # fix parameter
         'relation' : relation,
-        'hr_k' : 20,
-        'recall_k' : 20,
-        'ndcg_k' : 100
+        'hr_k' : 1,
+        'recall_k' : 10,
+        'ndcg_k' : 10
     }
 
     algo = BayesOptSearch()
@@ -234,7 +236,7 @@ def tune_population_based( relation : str ):
         config=config,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'yelp_dataset_{relation}',
+        name=f'ml1m_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
@@ -242,4 +244,4 @@ def tune_population_based( relation : str ):
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( 'BCity' )
+    tune_population_based( 'item_genre' )

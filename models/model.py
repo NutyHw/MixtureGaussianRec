@@ -1,16 +1,13 @@
 import math
 import torch
 import torch.nn.functional as F
+import torch.jit as jit
 import torch.nn as nn
 
 class Model( nn.Module ):
     def __init__( self, **kwargs ):
         super( Model, self ).__init__()
         self.num_latent = kwargs['num_latent']
-        self.mean_constraint = kwargs['mean_constraint']
-        self.sigma_min = kwargs['sigma_min']
-        self.sigma_max = kwargs['sigma_max']
-        self.eps = 1e-9
 
         self.embedding = nn.ParameterDict({
             'user_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_group'] ) ) ),
@@ -21,80 +18,109 @@ class Model( nn.Module ):
             'category_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
         })
 
-        self.transition_weight = nn.Linear( kwargs['num_category'], kwargs['num_category'], bias=True )
+        self.linear_model = nn.Linear( kwargs['num_category'], kwargs['num_category'] )
 
-    def prob_encoder( self ):
-        return torch.hstack( ( self.embedding['group_mu'], torch.exp( self.embedding['group_log_sigma'] ) ) ),\
-                torch.hstack( ( self.embedding['category_mu'], torch.exp( self.embedding['category_log_sigma'] ) ) )
+        # init 
+        self.xavier_init()
 
-    def compute_weight( self, kl_dist_mat : torch.Tensor ):
-        kl_dist_mat = ( kl_dist_mat - torch.mean( kl_dist_mat, dim=-1 ).reshape( -1, 1 ) ) / torch.std( kl_dist_mat, dim=-1 ).reshape( -1, 1 )
-        return torch.sigmoid( self.transition_weight( kl_dist_mat ) )
+    def xavier_init( self ):
+        for embedding in self.embedding.keys():
+            nn.init.xavier_normal_( self.embedding[embedding] )
+        nn.init.xavier_normal_( self.linear_model.weight )
 
-    def compute_mixture_gaussian_expected_likehood( self, k1, k2, p, q ):
-        k1, k2 = k1.unsqueeze( dim=2 ), k2.unsqueeze( dim=1 )
-        return torch.log(
-                    torch.sum(
-                        torch.sum(
-                            k1 * k2 * self.compute_gaussian_expected_likehood( p, q ).unsqueeze( dim=0 ),
-                            dim=-1
-                        ),
-                        dim=-1
-                    )
-                ).reshape( -1, 1 )
+    def _compute_kl_div( self, **kwargs):
+        gaussian1_mu = kwargs['gaussian1_mu'].unsqueeze( dim=0 )
+        gaussian1_sigma = kwargs['gaussian1_sigma'].unsqueeze( dim=0 )
+        gaussian2_mu = kwargs['gaussian2_mu'].unsqueeze( dim=1 )
+        gaussian2_sigma = kwargs['gaussian2_sigma'].unsqueeze( dim=1 )
 
-    def compute_gaussian_expected_likehood( self, p : torch.Tensor, q : torch.Tensor ):
-        mu_p, sigma_p = torch.hsplit( p, 2 )
-        mu_q, sigma_q = torch.hsplit( q, 2 )
+        log_sigma = torch.log( 
+            torch.prod( gaussian2_sigma, dim=-1 ) \
+            / torch.prod( gaussian1_sigma, dim=-1 )
+        )
+        trace_sigma = torch.sum( ( 1 / gaussian2_sigma ) * gaussian1_sigma, dim=-1 )
 
-        sigma_p, sigma_q = sigma_p.unsqueeze( dim=2 ), sigma_q.T.unsqueeze( dim=0 )
-        mu_p, mu_q = mu_p.unsqueeze( dim=2 ), mu_q.T.unsqueeze( dim=0 )
+        sum_mu_sigma = torch.sum( torch.square( gaussian1_mu - gaussian2_mu ) * ( 1 / gaussian2_sigma ), dim=-1 )
 
-        return torch.exp(
-            0.5 * ( -\
-                torch.log( torch.prod( sigma_p + sigma_q, dim=1 ) ) -\
-                self.num_latent * torch.log( torch.tensor( [ 2 * math.pi ] ) ) -\
-                torch.sum( ( mu_p - mu_q ) ** 2 * ( 1 / ( sigma_p + sigma_q ) ), dim=1 )
-            )
+        return 0.5 * ( log_sigma + trace_sigma - self.num_latent + sum_mu_sigma ).T
+
+    def _compute_mixture_kl_div( self, **kwargs ):
+        mixture1, mixture2 = kwargs['mixture1'], kwargs['mixture2']
+        kl_div_mat = torch.exp( - kwargs['group_category_kl_div_mat'] )
+        kl_div_mat2 = torch.exp( - kwargs['group_group_kl_div_mat'] )
+
+        return torch.sum(
+            mixture1.unsqueeze( dim=2 ) * torch.log( 
+                torch.matmul( mixture1, kl_div_mat2.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat.T ).unsqueeze( dim=0 )
+            ).transpose( dim0=1, dim1=2 )
+        ,dim=1 )
+
+    def _compute_transition_prob( self, **kwargs):
+        kl_div_mat = kwargs['group_category_kl_div_mat']
+
+        # normalize
+        kl_div_mat = ( kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) ) \
+            / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
+
+        transition_prob = torch.sigmoid( self.linear_model( kl_div_mat ) )
+
+        prob = torch.linalg.multi_dot(
+            ( kwargs['mixture1'], transition_prob, kwargs['mixture2'].T )
         )
 
-    def constraint_distribution( self ):
-        self.embedding['group_mu'].data.clamp_( - ( self.mean_constraint ** 0.5 ), self.mean_constraint ** 0.5 )
-        self.embedding['category_mu'].data.clamp_( - ( self.mean_constraint ** 0.5 ), self.mean_constraint ** 0.5 )
+        return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
-        self.embedding['group_log_sigma'].data.clamp_( math.log( self.sigma_min ), math.log( self.sigma_max ) )
-        self.embedding['category_log_sigma'].data.clamp_( math.log( self.sigma_min ), math.log( self.sigma_max ) )
+    def _kl_div_to_normal_gauss( self ):
+        group_mu, group_sigma = self.embedding['group_mu'], torch.exp( self.embedding['group_log_sigma'] )
+        category_mu, category_sigma = self.embedding['category_mu'], torch.exp( self.embedding['category_log_sigma'] )
 
-    def forward( self, user_idx, item_idx, is_test = False ):
-        self.constraint_distribution()
-        unique_user_idx, user_indices = torch.unique( user_idx, return_inverse=True, sorted=True )
-        group_prob, category_prob = self.prob_encoder()
+        all_mu, all_sigma = torch.vstack( ( group_mu, category_mu ) ), torch.vstack( ( group_sigma, category_sigma ) )
 
-        if is_test:
-            user_k = torch.softmax( self.embedding['user_embedding'][ user_idx ], dim=-1 )
-            item_k = torch.softmax( self.embedding['item_embedding'], dim=-1 )
-            transition = self.compute_weight( self.compute_gaussian_expected_likehood( group_prob, category_prob ) )
+        return 0.5 * (
+            torch.sum( torch.square( all_mu ), dim=-1 ) \
+            + torch.sum( all_sigma, dim=-1 ) \
+            - self.num_latent \
+            - torch.log( torch.prod( all_sigma, dim=-1 ) )
+        )
 
-            return torch.linalg.multi_dot( ( user_k, transition, item_k.T ) )
+    def forward( self, user_idx ):
+        user_embedding = torch.softmax( self.embedding['user_embedding'][ user_idx ], dim=-1 )
+        item_embedding = torch.softmax( self.embedding['item_embedding'], dim=-1 )
 
-        unique_item_idx, item_indices = torch.unique( item_idx, return_inverse=True, sorted=True )
+        group_category_kl_div_mat = self._compute_kl_div( 
+            gaussian1_mu=self.embedding['group_mu'],
+            gaussian2_mu=self.embedding['category_mu'],
+            gaussian1_sigma=torch.exp( self.embedding['group_log_sigma'] ),
+            gaussian2_sigma=torch.exp( self.embedding['category_log_sigma'] )
+        )
 
-        user_k = torch.softmax( self.embedding['user_embedding'][ unique_user_idx ], dim=-1 )
-        item_k = torch.softmax( self.embedding['item_embedding'][ unique_item_idx ], dim=-1 )
+        group_group_kl_div_mat = self._compute_kl_div( 
+            gaussian1_mu=self.embedding['group_mu'],
+            gaussian2_mu=self.embedding['group_mu'],
+            gaussian1_sigma=torch.exp( self.embedding['group_log_sigma'] ),
+            gaussian2_sigma=torch.exp( self.embedding['group_log_sigma'] )
+        )
 
-        transition = self.compute_weight( self.compute_gaussian_expected_likehood( group_prob, category_prob ) )
-        kl_div = self.compute_mixture_gaussian_expected_likehood( user_k[ user_indices ], item_k[ item_indices ], group_prob, category_prob )
+        mixture_user_item_kl_div = self._compute_mixture_kl_div( 
+            mixture1=user_embedding,
+            mixture2=item_embedding,
+            group_category_kl_div_mat=group_category_kl_div_mat,
+            group_group_kl_div_mat=group_group_kl_div_mat
+        )
 
-        return {
-            'out' : kl_div,
-            'kg_prob' : torch.linalg.multi_dot( ( user_k, transition, item_k.T ) )[ user_indices, item_indices ].reshape( -1, 1 ),
-            'category_kg' : torch.log( item_k + self.eps )
-        }
+        transition_prob = self._compute_transition_prob(
+            mixture1=user_embedding,
+            mixture2=item_embedding,
+            group_category_kl_div_mat=group_category_kl_div_mat
+        )
+
+        return mixture_user_item_kl_div, transition_prob, torch.sum( self._kl_div_to_normal_gauss() ), item_embedding 
 
 if __name__ == '__main__':
-    model = Model( 943, 1682, 18, 10, 8, 100, 0.01, 10 )
-    # print( model( torch.tensor([ 0, 1 ]), torch.tensor([ 1, 2 ]) ) )
-    print( model( torch.tensor([ 0, 1 ]), torch.tensor([ 1, 2 ]), is_test=True ) )
+    model = Model( num_user=943, num_item=1682, num_category=500, num_group=50, num_latent=128, beta=10 ) 
+    trace_model = jit.trace( model, torch.tensor([ 0, 1 ]) )
+    mixture_kl_div, transition_prob, regularization, item_embedding = trace_model( torch.tensor([ 0, 1 ]) )
+    print( mixture_kl_div, transition_prob )
     # optimizer = optim.RMSprop( model.parameters(), lr=1e-2 )
 
     # bce_loss = nn.BCELoss()
