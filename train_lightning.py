@@ -36,6 +36,10 @@ class ModelTrainer( pl.LightningModule ):
         config['num_item'] = self.n_items
         config['num_category'] = self.reg_mat.shape[1]
         config['num_group'] = int( round( self.config['num_group'] ) )
+        if self.reg_mat.shape[0] == self.dataset.n_users:
+            config['attribute'] = 'user_attribute'
+        elif self.reg_mat.shape[0] == self.dataset.n_items:
+            config['attribute'] = 'item_attribute'
 
         model = Model( **config )
         self.model = jit.trace( model, torch.tensor([ 0, 1 ]) )
@@ -61,7 +65,7 @@ class ModelTrainer( pl.LightningModule ):
         )
 
     def compute_cross_entropy( self, predict_prob, true_prob ):
-        return torch.sum( - true_prob * torch.log( predict_prob ), dim=1 )
+        return - torch.sum( true_prob * torch.log( predict_prob ), dim=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -85,23 +89,30 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         user_idx, x_adj, prob_adj = batch
 
-        mixture_kl_div, transition_prob, regularization, item_embedding = self.model( user_idx )
+        norm_true_prob = prob_adj / torch.sum( prob_adj, dim=-1 ).reshape( -1, 1 )
 
-        alpha = self.config['alpha'] * self.config['lambda'] ** self.current_epoch
-        beta = self.config['beta'] * self.config['lambda'] ** self.current_epoch
+        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
+
+        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
+        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
 
         # compute loss
-        l1 = torch.sum( self.negative_log_likehood( mixture_kl_div, x_adj, self.config['beta1'] ) )
-        l2 = torch.sum( self.compute_cross_entropy( transition_prob, x_adj ) )
-        l3 = self.compute_joint_distillation( mixture_kl_div, transition_prob, self.config['beta2'] )
+        l1 = torch.sum( self.compute_cross_entropy( mixture_prob, norm_true_prob ) )
+        l2 = torch.sum( self.compute_cross_entropy( transition_prob, norm_true_prob ) )
+        l3 = F.kl_div( transition_prob, mixture_prob, reduction='sum' )
 
         loss = alpha * l1 + beta * l2 + l3
 
         # regularization
-        norm_regularization = torch.mean( regularization )
-        item_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='batchmean' )
+        norm_regularization = torch.sum( regularization )
+        attribute_regularization = 0
 
-        reg_loss = self.config['gamma'] * ( norm_regularization + item_regularization )
+        if self.config['attribute'] == 'item_attribute':
+            attribute_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='batchmean' )
+        elif self.config['attribute'] == 'user_attribute':
+            attribute_regularization = F.kl_div( torch.log( user_embedding ), self.reg_mat, reduction='batchmean' )
+
+        reg_loss = self.config['gamma'] * ( norm_regularization + attribute_regularization )
 
         return loss + reg_loss
 
@@ -110,13 +121,13 @@ class ModelTrainer( pl.LightningModule ):
 
     def validation_step( self, batch, batch_idx ):
         user_idx, _, _ = batch
-        mixture_kl_div, _, _, _ = self.model( user_idx )
+        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
 
-        self.y_pred = torch.vstack( ( self.y_pred, - mixture_kl_div ) )
+        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = -np.inf
+        self.y_pred[ ~val_mask ] = 0
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -133,13 +144,13 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_step( self, batch, batch_idx ):
         user_idx, x_adj, prob_adj = batch
-        mixture_kl_div, _, _, _ = self.model( user_idx )
+        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
 
-        self.y_pred = torch.vstack( ( self.y_pred, - mixture_kl_div ) )
+        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = -np.inf
+        self.y_pred[ ~test_mask ] = 0
         torch.save( self.y_pred, f'{self.config["relation"]}_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
@@ -200,18 +211,19 @@ def tune_population_based( relation : str ):
     dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
-        'num_latent' : 64,
+        'num_latent' : 128,
         'batch_size' : 32,
 
         # hopefully will find right parameter
         'num_group' : tune.uniform(4,51),
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
         'lr' : tune.uniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 1, 10 ),
-        'beta' : tune.uniform( 1, 10 ),
-        'beta1' : tune.uniform( 1e-2, 10 ),
-        'beta2' : tune.uniform( 1e-2, 10 ),
-        'lambda' : tune.uniform( 0.8, 1 ),
+        'alpha' : tune.uniform( 5, 50 ),
+        'min_alpha' : tune.uniform( 1e-2, 25 ),
+        'beta' : tune.uniform( 1, 50 ),
+        'beta2' : tune.uniform( 5, 50 ),
+        'min_beta2' : tune.uniform( 1e-2, 25 ),
+        'lambda' : tune.uniform( 0, 1 ),
 
         # fix parameter
         'relation' : relation,
@@ -224,6 +236,7 @@ def tune_population_based( relation : str ):
     algo = ConcurrencyLimiter(algo, max_concurrent=10)
 
     scheduler = ASHAScheduler(
+        max_t=256,
         grace_period=10,
         reduction_factor=2
     )
