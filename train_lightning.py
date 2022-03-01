@@ -3,6 +3,7 @@ import sys
 import json 
 from functools import partial
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.jit as jit
@@ -56,11 +57,11 @@ class ModelTrainer( pl.LightningModule ):
         return F.kl_div( 
             torch.log( torch.softmax( - energy_res * beta, dim=-1 ) ),
             transition_prob,
-            reduction='batchmean'
+            reduction='sum'
         )
 
-    def compute_cross_entropy( self, predict_prob, true_prob, confidence ):
-        return torch.sum( - true_prob * torch.log( predict_prob ) * confidence, dim=1 )
+    def compute_cross_entropy( self, predict_prob, true_prob ):
+        return torch.sum( - true_prob * torch.log( predict_prob ), dim=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -83,7 +84,6 @@ class ModelTrainer( pl.LightningModule ):
 
     def training_step( self, batch, batch_idx ):
         user_idx, x_adj, prob_adj = batch
-        norm_x_adj = x_adj / torch.sum( x_adj, dim=-1 ).reshape( -1, 1 )
 
         mixture_kl_div, transition_prob, regularization, item_embedding = self.model( user_idx )
 
@@ -91,15 +91,15 @@ class ModelTrainer( pl.LightningModule ):
         beta = self.config['beta'] * self.config['lambda'] ** self.current_epoch
 
         # compute loss
-        l1 = torch.mean( self.negative_log_likehood( mixture_kl_div, x_adj, self.config['beta1'] ) )
-        l2 = torch.mean( self.compute_cross_entropy( transition_prob, norm_x_adj, prob_adj * self.config['confidence'] ) )
+        l1 = torch.sum( self.negative_log_likehood( mixture_kl_div, x_adj, self.config['beta1'] ) )
+        l2 = torch.sum( self.compute_cross_entropy( transition_prob, x_adj ) )
         l3 = self.compute_joint_distillation( mixture_kl_div, transition_prob, self.config['beta2'] )
 
         loss = alpha * l1 + beta * l2 + l3
 
         # regularization
-        norm_regularization = torch.sum( regularization )
-        item_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='sum' )
+        norm_regularization = torch.mean( regularization )
+        item_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='batchmean' )
 
         reg_loss = self.config['gamma'] * ( norm_regularization + item_regularization )
 
@@ -116,7 +116,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
+        self.y_pred[ ~val_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -125,6 +125,8 @@ class ModelTrainer( pl.LightningModule ):
             'recall_score' : recall_score,
             'ndcg_score' : ndcg_score
         })
+
+        self.y_pred = None
 
     def on_test_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
@@ -137,7 +139,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        self.y_pred[ ~test_mask ] = -np.inf
         torch.save( self.y_pred, f'{self.config["relation"]}_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
@@ -149,7 +151,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -199,7 +201,7 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 256,
+        'batch_size' : 32,
 
         # hopefully will find right parameter
         'num_group' : tune.uniform(4,51),
@@ -209,8 +211,7 @@ def tune_population_based( relation : str ):
         'beta' : tune.uniform( 1, 10 ),
         'beta1' : tune.uniform( 1e-2, 10 ),
         'beta2' : tune.uniform( 1e-2, 10 ),
-        'lambda' : tune.uniform( 0, 1 ),
-        'confidence' : tune.uniform( 10, 100 ),
+        'lambda' : tune.uniform( 0.8, 1 ),
 
         # fix parameter
         'relation' : relation,
@@ -220,7 +221,7 @@ def tune_population_based( relation : str ):
     }
 
     algo = BayesOptSearch()
-    algo = ConcurrencyLimiter(algo, max_concurrent=50)
+    algo = ConcurrencyLimiter(algo, max_concurrent=10)
 
     scheduler = ASHAScheduler(
         grace_period=10,
