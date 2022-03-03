@@ -51,3 +51,4 @@ if __name__ == '__main__':
     model2 = Model( num_user=943, num_item=1682, num_category=500, num_group=25, num_latent=128, beta=10, attribute='user_attribute' ) 
     ensemble_model = EnsembleModel( num_user=943, num_item=1682, based_model=[ model1, model2 ] )
     mixture_kl_div, transition_prob = ensemble_model( torch.tensor([ 0, 1 ]) )
+    print( mixture_kl_div.shape, transition_prob.shape )
