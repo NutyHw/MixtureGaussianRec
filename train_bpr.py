@@ -108,7 +108,6 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         max_epochs=256, 
         num_sanity_val_steps=0,
-        limit_train_batches=1,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
@@ -143,12 +142,12 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=10 )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = Ml1mDataset()
     dataset = ray.put( dataset )
     config = {
         # grid search parameter
-        'num_latent' : tune.choice([ 32, 64, 128 ]),
+        'num_latent' : tune.choice([ 8, 16, 32, 64 ]),
         'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
 
         # hopefully will find right parameter

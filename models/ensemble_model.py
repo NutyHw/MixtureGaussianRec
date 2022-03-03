@@ -4,8 +4,6 @@ import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from model import Model
-import torch.jit as jit
 
 class EnsembleModel( nn.Module ):
     def __init__( self, **kwargs ):

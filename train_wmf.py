@@ -54,6 +54,7 @@ def validate_model( model, dataset, csr_matrix ):
     mask, true_y = dataset.get_test()
     y_pred = torch.zeros( ( dataset.n_users, dataset.n_items ) ).scatter_( 1, torch.tensor( item_id ).to( torch.int64 ), torch.tensor( score ) )
     y_pred[ ~mask ] = 0
+    torch.save( y_pred, 'wmf_predict.pt' )
     test_hr_score, test_recall_score, test_ndcg_score = evaluate( true_y, y_pred, 1, 10, 10)
 
     tune.report({
@@ -72,7 +73,7 @@ def train_model( config : dict, dataset ):
     model = implicit.als.AlternatingLeastSquares( 
         factors=config['num_latent'],
         regularization=config['gamma'],
-        iterations=1
+        iterations=10
     )
 
     model.fit( csr_matrix, show_progress=True )
@@ -80,6 +81,7 @@ def train_model( config : dict, dataset ):
     validate_model( model, dataset, csr_matrix )
 
 if __name__ == '__main__':
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Ml1mDataset() )
     config = {
         'num_latent' : tune.randint( 10, 200 ),
@@ -88,12 +90,13 @@ if __name__ == '__main__':
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
+        resources_per_trial={ 'cpu' : 2 },
         config=config,
         metric='_metric/val_ndcg_score',
         mode='max',
-        num_samples=1,
+        num_samples=100,
         local_dir='/data2/saito/',
-        name='train_wmf'
+        name='ml1m_wmf'
     )
 
     with open('best_model.json','w') as f:

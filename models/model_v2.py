@@ -13,7 +13,7 @@ class Model( nn.Module ):
 
         self.embedding = nn.ParameterDict({
             'user_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) ),
-            'item_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) ),
+            'item_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) ),
             'category_mu' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
             'category_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
         })
@@ -47,12 +47,11 @@ class Model( nn.Module ):
 
     def _compute_mixture_kl_div( self, **kwargs ):
         mixture1, mixture2 = kwargs['mixture1'], kwargs['mixture2']
-        kl_div_mat = torch.exp( - kwargs['group_category_kl_div_mat'] )
         kl_div_mat2 = torch.exp( - kwargs['group_group_kl_div_mat'] )
 
         return torch.sum(
             mixture1.unsqueeze( dim=2 ) * torch.log( 
-                torch.matmul( mixture1, kl_div_mat2.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat.T ).unsqueeze( dim=0 )
+                torch.matmul( mixture1, kl_div_mat2.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat2.T ).unsqueeze( dim=0 )
             ).transpose( dim0=1, dim1=2 )
         ,dim=1 )
 
@@ -98,7 +97,6 @@ class Model( nn.Module ):
         mixture_user_item_kl_div = self._compute_mixture_kl_div( 
             mixture1=user_embedding,
             mixture2=item_embedding,
-            group_category_kl_div_mat=group_group_kl_div_mat,
             group_group_kl_div_mat=group_group_kl_div_mat
         )
 
@@ -108,7 +106,7 @@ if __name__ == '__main__':
     model = Model( num_user=943, num_item=1682, num_category=500, num_group=25, num_latent=128, beta=10, attribute='user_attribute' ) 
     trace_model = jit.trace( model, torch.tensor([ 0, 1 ]) )
     mixture_kl_div, regularization, user_embedding, item_embedding = trace_model( torch.tensor([ 0, 1 ]) )
-    print( mixture_kl_div )
+    print( mixture_kl_div.shape )
     # optimizer = optim.RMSprop( model.parameters(), lr=1e-2 )
 
     # bce_loss = nn.BCELoss()

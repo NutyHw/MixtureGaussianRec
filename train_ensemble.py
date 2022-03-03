@@ -19,7 +19,10 @@ from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
+from ray.tune.suggest import ConcurrencyLimiter
+from ray.tune.suggest.bayesopt import BayesOptSearch
 from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+from load_experiment import load_experiment
 
 class EnsembleTrainer( pl.LightningModule ):
     def __init__( self, dataset, based_model, config ):
@@ -114,6 +117,7 @@ class EnsembleTrainer( pl.LightningModule ):
         test_mask, true_y = self.dataset.get_test()
         self.y_pred[ ~test_mask ] = 0
 
+        torch.save( self.y_pred, f'ensemble_predict.pt' )
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
@@ -126,12 +130,7 @@ class EnsembleTrainer( pl.LightningModule ):
         optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
-def load_models( checkpoint_dir ):
-    params = None
-
-    with open( os.path.join( checkpoint_dir, 'params.json' ) ) as f:
-        params = json.load( f )
-
+def load_models( checkpoint_dir, params ):
     state_dict = torch.load( os.path.join( checkpoint_dir, 'checkpoint' ) )['state_dict']
     new_state_dict = dict()
 
@@ -142,6 +141,11 @@ def load_models( checkpoint_dir ):
     params['num_item'] = new_state_dict['embedding.item_embedding'].shape[0]
     params['num_group'] = new_state_dict['embedding.group_mu'].shape[0]
     params['num_category'] = new_state_dict['embedding.category_mu'].shape[0]
+
+    if new_state_dict['embedding.user_embedding'].shape[1] == params['num_group']:
+        params['attribute'] = 'item_attribute' 
+    else:
+        params['attribute'] = 'user_attribute' 
 
     model = Model( **params )
     model.load_state_dict( state_dict=new_state_dict )
@@ -167,7 +171,6 @@ def train_model( config, checkpoint_dir=None, dataset=None, based_model=None):
         max_epochs=256, 
         num_sanity_val_steps=0,
         callbacks=[
-            Scheduler(),
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
                 'recall_score' : 'recall_score',
@@ -176,7 +179,7 @@ def train_model( config, checkpoint_dir=None, dataset=None, based_model=None):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -184,10 +187,16 @@ def train_model( config, checkpoint_dir=None, dataset=None, based_model=None):
     model = EnsembleTrainer( dataset=dataset, based_model=based_model, config=config )
     trainer.fit( model )
 
-def tune_model( best_model_path_1 : str, best_model_path_2 : str ):
-    ray.init( num_cpus=1 )
+def tune_model( best_checkpoint : list, best_config : list ):
+    ray.init( num_cpus=16, _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Dataset( 'item_genre' ) )
-    based_model = ray.put( [ load_models( best_model_path_1 ), load_models (best_model_path_2)  ] )
+
+    all_models = list()
+    for i in range( len( best_checkpoint ) ):
+        model = load_models( best_checkpoint[i], best_config[i] )
+        all_models.append( model )
+
+    based_model = ray.put( all_models )
 
     config = {
         # parameter to find
@@ -207,6 +216,9 @@ def tune_model( best_model_path_1 : str, best_model_path_2 : str ):
         'ndcg_k' : 10
     }
 
+    algo = BayesOptSearch()
+    algo = ConcurrencyLimiter(algo, max_concurrent=10)
+
     scheduler = ASHAScheduler(
         max_t=256,
         grace_period=10,
@@ -215,20 +227,27 @@ def tune_model( best_model_path_1 : str, best_model_path_2 : str ):
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset, based_model=based_model),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=1,
+        num_samples=200,
         verbose=1,
         config=config,
+        search_alg=algo,
         scheduler=scheduler,
         name=f'ml1m_ensemble_model',
-        local_dir=".",
+        local_dir="/data2/saito/",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )
 
-    test_model( analysis.best_config, analysis.best_checkpoint, dataset, model1, model2 )
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset, based_model )
 
 if __name__ == '__main__':
-    tune_model( './best_models/yelp/BCat/', './best_models/yelp/BCity/' )
+    item_genre_best_config, item_genre_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_item_genre' ) 
+    user_age_best_config, user_age_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_user_age' ) 
+    user_jobs_best_config, user_jobs_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_user_jobs' ) 
+    tune_model( 
+            [ item_genre_checkpoint_dir, user_age_checkpoint_dir, user_jobs_checkpoint_dir ],
+            [ item_genre_best_config, user_age_best_config, user_jobs_best_config ]
+    )
