@@ -47,10 +47,10 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], shuffle=False )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'] )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=self.config['batch_size'], shuffle=False )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -143,7 +143,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -168,7 +168,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=1 )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Ml1mDataset() )
     config = {
         # grid search parameter
@@ -186,22 +186,21 @@ def tune_model():
     }
 
     scheduler = ASHAScheduler(
-        max_t=1,
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=1,
+        num_samples=100,
         verbose=1,
         config=config,
         scheduler=scheduler,
-        name=f'yelp_vae',
-        local_dir="./",
+        name=f'ml1m_vae',
+        local_dir="/data2/saito/",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )
