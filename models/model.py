@@ -21,12 +21,11 @@ class Model( nn.Module ):
         if kwargs['attribute'] == 'user_attribute':
             self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) )
             self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_group'] ) ) )
-            self.linear_model = nn.Linear( kwargs['num_group'], kwargs['num_group'], bias=True )
         elif kwargs['attribute'] == 'item_attribute':
             self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_group'] ) ) )
             self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) )
-            self.linear_model = nn.Linear( kwargs['num_category'], kwargs['num_category'], bias=True )
 
+        self.linear_model = nn.Linear( 1, 1, bias=True )
 
         # init 
         self.xavier_init()
@@ -79,12 +78,13 @@ class Model( nn.Module ):
 
     def _compute_transition_prob( self, **kwargs):
         kl_div_mat = kwargs['group_category_kl_div_mat']
+        temp = kl_div_mat.shape
 
         # normalize
         kl_div_mat = ( kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) ) \
             / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
 
-        transition_prob = torch.sigmoid( self.linear_model( kl_div_mat ) )
+        transition_prob = torch.sigmoid( self.linear_model( kl_div_mat.reshape( -1, 1 ) ).reshape( temp[0], temp[1] ) )
 
         prob = torch.linalg.multi_dot(
             ( kwargs['mixture1'], transition_prob, kwargs['mixture2'].T )
