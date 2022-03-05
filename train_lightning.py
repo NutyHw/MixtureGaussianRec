@@ -22,11 +22,15 @@ from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.bayesopt import BayesOptSearch
 
-from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+if sys.argv[1] == 'ml1m':
+    from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+elif sys.argv[1] == 'yelp':
+    from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 class ModelTrainer( pl.LightningModule ):
-    def __init__( self, config : dict, dataset=None ):
+    def __init__( self, config : dict, dataset=None, lr=1e-3 ):
         super().__init__()
+        self.learning_rate = lr
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
@@ -35,7 +39,7 @@ class ModelTrainer( pl.LightningModule ):
         config['num_user'] = self.n_users
         config['num_item'] = self.n_items
         config['num_category'] = self.reg_mat.shape[1]
-        config['num_group'] = int( round( self.config['num_group'] ) )
+
         if self.reg_mat.shape[0] == self.dataset.n_users:
             config['attribute'] = 'user_attribute'
         elif self.reg_mat.shape[0] == self.dataset.n_items:
@@ -56,16 +60,6 @@ class ModelTrainer( pl.LightningModule ):
     def negative_log_likehood( self, energy_res, x_adj, beta ):
         return torch.sum( energy_res * x_adj, dim=-1 ) \
             + ( 1 / beta ) * torch.log( torch.sum( torch.exp( - beta * energy_res ), dim=-1 ) )
-
-    def compute_joint_distillation( self, energy_res, transition_prob, beta ):
-        return F.kl_div( 
-            torch.log( torch.softmax( - energy_res * beta, dim=-1 ) ),
-            transition_prob,
-            reduction='sum'
-        )
-
-    def compute_cross_entropy( self, predict_prob, true_prob ):
-        return - torch.sum( true_prob * torch.log( predict_prob ), dim=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -89,22 +83,13 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         user_idx, x_adj, prob_adj = batch
 
-        norm_true_prob = x_adj / torch.sum( x_adj, dim=-1 ).reshape( -1, 1 )
-
-        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
-
-        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
-        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
+        mixture_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
 
         # compute loss
-        l1 = torch.sum( self.compute_cross_entropy( mixture_prob, norm_true_prob ) )
-        l2 = torch.sum( self.compute_cross_entropy( transition_prob, norm_true_prob ) )
-        l3 = F.kl_div( transition_prob, mixture_prob, reduction='sum' )
-
-        loss = alpha * l1 + beta * l2 + l3
+        loss  = torch.mean( self.negative_log_likehood(  mixture_prob, x_adj, beta=self.config['beta'] ) )
 
         # regularization
-        norm_regularization = torch.sum( regularization )
+        norm_regularization = torch.mean( regularization )
         attribute_regularization = 0
 
         if self.config['attribute'] == 'item_attribute':
@@ -121,13 +106,13 @@ class ModelTrainer( pl.LightningModule ):
 
     def validation_step( self, batch, batch_idx ):
         user_idx, _, _ = batch
-        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
+        mixture_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
 
-        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - mixture_prob ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
+        self.y_pred[ ~val_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -144,13 +129,13 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_step( self, batch, batch_idx ):
         user_idx, x_adj, prob_adj = batch
-        mixture_prob, transition_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
+        mixture_prob, regularization, user_embedding, item_embedding = self.model( user_idx )
 
-        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - mixture_prob ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        self.y_pred[ ~test_mask ] = -np.inf
         torch.save( self.y_pred, f'{self.config["relation"]}_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
@@ -162,13 +147,15 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         max_epochs=256, 
         num_sanity_val_steps=0,
+        limit_train_batches=1,
+        auto_lr_find=True,
         callbacks=[
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
@@ -190,6 +177,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
 
     model = ModelTrainer( config, dataset )
 
+    # trainer.tune( model )
     trainer.fit( model )
 
 def test_model( config : dict, checkpoint_dir : str, dataset ):
@@ -206,27 +194,21 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def tune_population_based( relation : str ):
-    ray.init( num_cpus=12, _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( relation ) )
+def tune_population_based():
+    ray.init( num_cpus=1 )
+    dataset = ray.put( Dataset( sys.argv[2] ) )
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 128,
+        'batch_size' : 32,
 
         # hopefully will find right parameter
-        'num_group' : tune.uniform(4,51),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
         'lr' : tune.uniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 5, 50 ),
-        'min_alpha' : tune.uniform( 1e-2, 25 ),
-        'beta' : tune.uniform( 1, 50 ),
-        'beta2' : tune.uniform( 5, 50 ),
-        'min_beta2' : tune.uniform( 1e-2, 25 ),
-        'lambda' : tune.uniform( 0.6, 1 ),
+        'beta' : tune.uniform( 1e-5, 10 ),
+        'gamma' : tune.uniform( 1e-5, 1e-1 ),
 
         # fix parameter
-        'relation' : relation,
+        'relation' : sys.argv[2],
         'hr_k' : 1,
         'recall_k' : 10,
         'ndcg_k' : 10
@@ -236,28 +218,28 @@ def tune_population_based( relation : str ):
     algo = ConcurrencyLimiter(algo, max_concurrent=10)
 
     scheduler = ASHAScheduler(
-        max_t=256,
-        grace_period=10,
+        max_t=1,
+        grace_period=1,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_score',
         mode='max',
-        num_samples=200,
+        num_samples=1,
         verbose=1,
         config=config,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'ml1m_dataset_{relation}',
+        name=f'{sys.argv[1]}_dataset_{sys.argv[2]}',
         keep_checkpoints_num=2,
-        local_dir=f"/data2/saito/",
+        local_dir=f".",
         checkpoint_score_attr='ndcg_score',
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 
 if __name__ == '__main__':
-    tune_population_based( sys.argv[1] )
+    tune_population_based()
