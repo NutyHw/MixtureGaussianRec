@@ -8,24 +8,13 @@ class Model( nn.Module ):
     def __init__( self, **kwargs ):
         super( Model, self ).__init__()
         self.num_latent = kwargs['num_latent']
-        self.beta = kwargs['beta']
-        self.attribute = kwargs['attribute']
 
         self.embedding = nn.ParameterDict({
-            'group_mu' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_group'], kwargs['num_latent'] ) ) ),
-            'group_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_group'], kwargs['num_latent'] ) ) ),
+            'user_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) ),
+            'item_embedding' : nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) ),
             'category_mu' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
             'category_log_sigma' : nn.Parameter( torch.normal( 0, 1,( kwargs['num_category'], kwargs['num_latent'] ) ) ),
         })
-
-        if kwargs['attribute'] == 'user_attribute':
-            self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) )
-            self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_group'] ) ) )
-        elif kwargs['attribute'] == 'item_attribute':
-            self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_group'] ) ) )
-            self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) )
-
-        self.linear_model = nn.Linear( 1, 1, bias=True )
 
         # init 
         self.xavier_init()
@@ -33,20 +22,10 @@ class Model( nn.Module ):
     def xavier_init( self ):
         for embedding in self.embedding.keys():
             nn.init.xavier_normal_( self.embedding[embedding] )
-        nn.init.xavier_normal_( self.linear_model.weight )
 
     def _get_prob( self ):
-        if self.attribute == 'item_attribute':
-            return self.embedding['group_mu'], \
-                self.embedding['category_mu'], \
-                torch.exp( self.embedding['group_log_sigma'] ), \
-                torch.exp( self.embedding['category_log_sigma'] )
-
-        if self.attribute == 'user_attribute':
-            return self.embedding['category_mu'], \
-                self.embedding['group_mu'], \
-                torch.exp( self.embedding['category_log_sigma'] ), \
-                torch.exp( self.embedding['group_log_sigma'] )
+        return self.embedding['category_mu'], \
+            torch.exp( self.embedding['category_log_sigma'] )
 
     def _compute_kl_div( self, **kwargs):
         gaussian1_mu = kwargs['gaussian1_mu'].unsqueeze( dim=0 )
@@ -66,15 +45,15 @@ class Model( nn.Module ):
 
     def _compute_mixture_kl_div( self, **kwargs ):
         mixture1, mixture2 = kwargs['mixture1'], kwargs['mixture2']
-        kl_div_mat = torch.exp( - kwargs['group_category_kl_div_mat'] )
-        kl_div_mat2 = torch.exp( - kwargs['group_group_kl_div_mat'] )
+        kl_div_mat = torch.exp( - kwargs['category_category_kl_div_mat'] )
 
         return torch.sum(
             mixture1.unsqueeze( dim=2 ) * torch.log( 
-                torch.matmul( mixture1, kl_div_mat2.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat.T ).unsqueeze( dim=0 )
+                torch.matmul( mixture1, kl_div_mat.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat.T ).unsqueeze( dim=0 )
             ).transpose( dim0=1, dim1=2 )
         ,dim=1 )
 
+<<<<<<< HEAD
 
     def _compute_transition_prob( self, **kwargs):
         kl_div_mat = kwargs['group_category_kl_div_mat']
@@ -92,59 +71,44 @@ class Model( nn.Module ):
 
         return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
+=======
+>>>>>>> 546b7f9c46bded89cdca84909ea70b531b516c12
     def _kl_div_to_normal_gauss( self ):
-        group_mu, group_sigma = self.embedding['group_mu'], torch.exp( self.embedding['group_log_sigma'] )
         category_mu, category_sigma = self.embedding['category_mu'], torch.exp( self.embedding['category_log_sigma'] )
 
-        all_mu, all_sigma = torch.vstack( ( group_mu, category_mu ) ), torch.vstack( ( group_sigma, category_sigma ) )
-
         return 0.5 * (
-            torch.sum( torch.square( all_mu ), dim=-1 ) \
-            + torch.sum( all_sigma, dim=-1 ) \
+            torch.sum( torch.square( category_mu ), dim=-1 ) \
+            + torch.sum( category_sigma, dim=-1 ) \
             - self.num_latent \
-            - torch.log( torch.prod( all_sigma, dim=-1 ) )
+            - torch.log( torch.prod( category_sigma, dim=-1 ) )
         )
 
     def forward( self, user_idx ):
         user_embedding = torch.softmax( self.embedding['user_embedding'][ user_idx ], dim=-1 )
         item_embedding = torch.softmax( self.embedding['item_embedding'], dim=-1 )
 
-        gaussian1_mu, gaussian2_mu, gaussian1_sigma, gaussian2_sigma = self._get_prob()
-        group_category_kl_div_mat = self._compute_kl_div( 
-            gaussian1_mu=gaussian1_mu,
-            gaussian2_mu=gaussian2_mu,
-            gaussian1_sigma=gaussian1_sigma,
-            gaussian2_sigma=gaussian2_sigma
-        )
+        gaussian_mu, gaussian_sigma = self._get_prob()
 
-        group_group_kl_div_mat = self._compute_kl_div( 
-            gaussian1_mu=gaussian1_mu,
-            gaussian2_mu=gaussian1_mu,
-            gaussian1_sigma=gaussian1_sigma,
-            gaussian2_sigma=gaussian1_sigma
+        category_category_kl_div_mat = self._compute_kl_div( 
+            gaussian1_mu=gaussian_mu,
+            gaussian2_mu=gaussian_mu,
+            gaussian1_sigma=gaussian_sigma,
+            gaussian2_sigma=gaussian_sigma
         )
 
         mixture_user_item_kl_div = self._compute_mixture_kl_div( 
             mixture1=user_embedding,
             mixture2=item_embedding,
-            group_category_kl_div_mat=group_category_kl_div_mat,
-            group_group_kl_div_mat=group_group_kl_div_mat
+            category_category_kl_div_mat=category_category_kl_div_mat
         )
 
-        transition_prob = self._compute_transition_prob(
-            mixture1=user_embedding,
-            mixture2=item_embedding,
-            group_category_kl_div_mat=group_category_kl_div_mat
-        )
-
-        mixture_prob = torch.softmax( - self.beta * mixture_user_item_kl_div, dim=-1 )
-
-        return mixture_prob, transition_prob, torch.sum( self._kl_div_to_normal_gauss() ), user_embedding, item_embedding
+        return mixture_user_item_kl_div, self._kl_div_to_normal_gauss(), user_embedding, item_embedding
 
 if __name__ == '__main__':
     model = Model( num_user=943, num_item=1682, num_category=500, num_group=25, num_latent=128, beta=10, attribute='user_attribute' ) 
     trace_model = jit.trace( model, torch.tensor([ 0, 1 ]) )
-    mixture_kl_div, transition_prob, regularization, user_embedding, item_embedding = trace_model( torch.tensor([ 0, 1 ]) )
+    mixture_kl_div , regularization, user_embedding, item_embedding = trace_model( torch.tensor([ 0, 1 ]) )
+    print( mixture_kl_div )
     # optimizer = optim.RMSprop( model.parameters(), lr=1e-2 )
 
     # bce_loss = nn.BCELoss()
