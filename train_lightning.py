@@ -1,3 +1,4 @@
+import random
 import os
 import sys
 import json 
@@ -22,11 +23,17 @@ from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.bayesopt import BayesOptSearch
 
-from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+#from load_experiment import load_experiment
+
+if sys.argv[1] == 'ml1m':
+    from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+elif sys.argv[1] == 'yelp':
+    from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 class ModelTrainer( pl.LightningModule ):
-    def __init__( self, config : dict, dataset=None ):
+    def __init__( self, config : dict, dataset=None, learning_rate=1e-3 ):
         super().__init__()
+        self.learning_rate=learning_rate
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
@@ -97,20 +104,20 @@ class ModelTrainer( pl.LightningModule ):
         beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
 
         # compute loss
-        l1 = torch.sum( self.compute_cross_entropy( mixture_prob, norm_true_prob ) )
-        l2 = torch.sum( self.compute_cross_entropy( transition_prob, norm_true_prob ) )
-        l3 = F.kl_div( transition_prob, mixture_prob, reduction='sum' )
+        l1 = torch.mean( self.compute_cross_entropy( mixture_prob, norm_true_prob ) )
+        l2 = torch.mean( self.compute_cross_entropy( transition_prob, norm_true_prob ) )
+        l3 = F.kl_div( torch.log( transition_prob ), mixture_prob, reduction='batchmean' )
 
         loss = alpha * l1 + beta * l2 + l3
 
         # regularization
-        norm_regularization = torch.sum( regularization )
+        norm_regularization = torch.mean( regularization )
         attribute_regularization = 0
 
         if self.config['attribute'] == 'item_attribute':
-            attribute_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat, reduction='batchmean' )
+            attribute_regularization = F.kl_div( torch.log( item_embedding ), self.reg_mat + 1e-6, reduction='batchmean' )
         elif self.config['attribute'] == 'user_attribute':
-            attribute_regularization = F.kl_div( torch.log( user_embedding ), self.reg_mat[ user_idx ], reduction='batchmean' )
+            attribute_regularization = F.kl_div( torch.log( user_embedding ), self.reg_mat[ user_idx ] + 1e-6, reduction='batchmean' )
 
         reg_loss = self.config['gamma'] * ( norm_regularization + attribute_regularization )
 
@@ -162,7 +169,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.learning_rate )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -188,7 +195,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             checkpoint_dir, "checkpoint"
         )
 
-    model = ModelTrainer( config, dataset )
+    model = ModelTrainer( config=config, dataset=dataset )
 
     trainer.fit( model )
 
@@ -206,18 +213,18 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def tune_population_based( relation : str ):
-    ray.init( num_cpus=12, _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( relation ) )
+def tune_population_based( relation : str, dataset_name : str ):
+    ray.init( num_cpus=10, _temp_dir='/data2/saito/ray_tmp/' )
+    dataset = Dataset( relation )
+    dataset = ray.put( dataset )
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 128,
+        'batch_size' : 32,
 
         # hopefully will find right parameter
-        'num_group' : tune.uniform(4,51),
+        'num_group' : tune.uniform(4,101),
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
-        'lr' : tune.uniform( 1e-4, 1e-1 ),
         'alpha' : tune.uniform( 5, 50 ),
         'min_alpha' : tune.uniform( 1e-2, 25 ),
         'beta' : tune.uniform( 1, 50 ),
@@ -236,22 +243,21 @@ def tune_population_based( relation : str ):
     algo = ConcurrencyLimiter(algo, max_concurrent=10)
 
     scheduler = ASHAScheduler(
-        max_t=256,
-        grace_period=10,
+        grace_period=5,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_score',
         mode='max',
-        num_samples=200,
+        num_samples=100,
         verbose=1,
         config=config,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'ml1m_dataset_{relation}',
+        name=f'{dataset_name}_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
@@ -260,4 +266,4 @@ def tune_population_based( relation : str ):
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 
 if __name__ == '__main__':
-    tune_population_based( sys.argv[1] )
+    tune_population_based( sys.argv[2], sys.argv[1] )
