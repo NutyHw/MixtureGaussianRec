@@ -21,13 +21,11 @@ class Model( nn.Module ):
         if kwargs['attribute'] == 'user_attribute':
             self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_category'] ) ) )
             self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_group'] ) ) )
-            self.norm_layer = nn.LayerNorm( kwargs['num_group'] )
-            self.linear_model = nn.Linear( kwargs['num_group'], kwargs['num_group'], bias=True )
         elif kwargs['attribute'] == 'item_attribute':
             self.embedding['user_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_user'], kwargs['num_group'] ) ) )
             self.embedding['item_embedding'] = nn.Parameter( torch.normal( 0, 1, ( kwargs['num_item'], kwargs['num_category'] ) ) )
-            self.norm_layer = nn.LayerNorm( kwargs['num_category'] )
-            self.linear_model = nn.Linear( kwargs['num_category'], kwargs['num_category'], bias=True )
+
+        self.linear_model = nn.Linear( 1, 1, bias=True )
 
         # init 
         self.xavier_init()
@@ -35,7 +33,6 @@ class Model( nn.Module ):
     def xavier_init( self ):
         for embedding in self.embedding.keys():
             nn.init.xavier_normal_( self.embedding[embedding] )
-        nn.init.xavier_normal_( self.linear_model.weight )
         nn.init.xavier_normal_( self.linear_model.weight )
 
     def _get_prob( self ):
@@ -84,7 +81,10 @@ class Model( nn.Module ):
         temp = kl_div_mat.shape
 
         # normalize
-        transition_prob = torch.sigmoid( self.linear_model( self.norm_layer( kl_div_mat ) ) )
+        kl_div_mat = ( kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) ) \
+            / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
+
+        transition_prob = torch.sigmoid( self.linear_model( kl_div_mat.reshape( -1, 1 ) ).reshape( temp[0], temp[1] ) )
 
         prob = torch.linalg.multi_dot(
             ( kwargs['mixture1'], transition_prob, kwargs['mixture2'].T )
@@ -142,7 +142,7 @@ class Model( nn.Module ):
         return mixture_prob, transition_prob, torch.sum( self._kl_div_to_normal_gauss() ), user_embedding, item_embedding
 
 if __name__ == '__main__':
-    model = Model( num_user=943, num_item=1682, num_category=500, num_group=25, num_latent=128, beta=10, attribute='item_attribute' ) 
+    model = Model( num_user=943, num_item=1682, num_category=500, num_group=25, num_latent=128, beta=10, attribute='user_attribute' ) 
     trace_model = jit.trace( model, torch.tensor([ 0, 1 ]) )
     mixture_kl_div, transition_prob, regularization, user_embedding, item_embedding = trace_model( torch.tensor([ 0, 1 ]) )
     # optimizer = optim.RMSprop( model.parameters(), lr=1e-2 )
