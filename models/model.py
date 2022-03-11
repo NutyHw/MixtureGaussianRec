@@ -86,7 +86,7 @@ class Model( nn.Module ):
         self.embedding['group_log_sigma'].data.clamp_( math.log( self.sigma_min ), math.log( self.sigma_max ) )
         self.embedding['category_log_sigma'].data.clamp_( math.log( self.sigma_min ), math.log( self.sigma_max ) )
 
-    def forward( self, user_idx, item_idx ):
+    def forward( self, user_idx, item_idx, is_test ):
         self.constraint_distribution()
 
         group_prob, category_prob = self.prob_encoder()
@@ -106,9 +106,15 @@ class Model( nn.Module ):
             user_k,
             item_k,
             gaussian_expected_likehood
-        )[ inverse_user_idx, inverse_item_idx ].reshape( -1, 1 )
+        )
 
-        return kl_div, torch.linalg.multi_dot( ( user_k, transition, item_k.T ) )[ inverse_user_idx, inverse_item_idx ].reshape( -1, 1 ), user_k, item_k
+        transition_prob = torch.linalg.multi_dot( ( user_k, transition, item_k.T ) )
+
+        if not is_test:
+            kl_div = kl_div[ inverse_user_idx, inverse_item_idx ]
+            transition_prob = transition_prob[ inverse_user_idx, inverse_item_idx ]
+
+        return kl_div, transition_prob, user_k, item_k
 
 if __name__ == '__main__':
     # print( model( torch.tensor([ 0, 1 ]), torch.tensor([ 1, 2 ]) ) )
@@ -123,7 +129,7 @@ if __name__ == '__main__':
         sigma_max=5,
         attribute='user_attribute'
     )
-    res = model( torch.tensor([ 0, 1 ] ), torch.tensor([ 1, 5 ]) )
+    res = model( torch.tensor([ 0, 1 ] ), torch.tensor([ 1, 2, 3, 4, 5 ]) )
     print( res[0].shape, res[1].shape, res[2].shape )
     # optimizer = optim.RMSprop( model.parameters(), lr=1e-2 )
 
