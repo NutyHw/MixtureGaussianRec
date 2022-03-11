@@ -16,6 +16,7 @@ def train_model( config, dataset=None ):
     dataset = ray.get( dataset )
     n_users, n_items = dataset.n_users, self.dataset.n_items
     reg_mat = dataset.get_reg_mat( config['relation'] )
+    reg_mat  = ( reg_mat + 1e-6 ) / torch.sum( reg_mat, dim=-1 ).reshape( -1, 1 )
 
     config['num_user'] = n_users
     config['num_item'] = n_items
@@ -26,7 +27,7 @@ def train_model( config, dataset=None ):
 
     prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
     transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
-    kl_div_loss = nn.KLDivLoss()
+    kl_div_loss = nn.KLDivLoss( reduction='batchmean' )
 
     alpha = config['alpha']
     beta = config['beta']
@@ -64,7 +65,7 @@ def train_model( config, dataset=None ):
 
                 # regularization loss
                 item_idx = torch.unique( input_idx[:,1] - n_users, sorted=True )
-                category_reg = kl_div_loss( res[3], reg_mat[ item_idx ] )
+                category_reg = kl_div_loss( torch.log( reg_mat[ item_idx ] ), res[3] )
 
                 optimizer.zero_grad( set_to_none=True )
                 loss = l1_loss * alpha + l2_loss * beta + l3_loss + gamma * category_reg
@@ -73,9 +74,9 @@ def train_model( config, dataset=None ):
                 loss.backward()
                 optimizer.step()
 
-    result = torch.zeros( ( 0, 10000 ) )
+    result = torch.zeros( ( 0, 1000 ) )
     for idx, batch in enumerate( val_loader ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( n_items ), is_test=True  )
+        res, _, _, _ = model( batch[0][:,0], torch.arange( n_items ), is_test=True  )
         _, indices = torch.topk( res, k=1000, dim=-1 )
         result = torch.vstack( ( result, indices ) )
 
