@@ -1,17 +1,41 @@
+import os
 from functools import partial
 import torch
 import torch.nn as nn
 from models.model import Model
 import ray
+import numpy as np
 from ray import tune
 from torch.utils.data import TensorDataset, DataLoader
 from utilities.dataset.pantip_dataset import PantipDataset as Dataset
 from torch.optim import Adagrad
+from ndcg import ndcg
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
 
 def joint_loss( pos_result1, neg_result1, pos_result2, neg_result2 ):
     return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
-def train_model( config, dataset=None ):
+def evaluate( true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
+    user_mask = torch.sum( true_rating, dim=-1 ) > 0
+    predict_rating = predict_rating[ user_mask ]
+    true_rating = true_rating[ user_mask ]
+
+    _, top_k_indices = torch.topk( predict_rating, k=hr_k, dim=1, largest=True )
+    hr_score = torch.mean( ( torch.sum( torch.gather( true_rating, dim=1, index=top_k_indices ), dim=-1 ) > 0 ).to( torch.float ) )
+
+    _, top_k_indices = torch.topk( predict_rating, k=recall_k, dim=1, largest=True )
+
+    recall_score = torch.mean( 
+        torch.sum( torch.gather( true_rating, dim=1, index = top_k_indices ), dim=1 ) /
+        torch.minimum( torch.sum( true_rating, dim=1 ), torch.tensor( [ recall_k ] ) )
+    )
+
+    ndcg_score = torch.mean( ndcg( predict_rating, true_rating, [ ndcg_k ] ) )
+
+    return hr_score.item(), recall_score.item(), ndcg_score.item()
+
+def train_model( config, dataset=None, checkpoint_dir=None ):
     config = config
     dataset = ray.get( dataset )
     n_users, n_items = dataset.n_users, self.dataset.n_items
@@ -37,6 +61,12 @@ def train_model( config, dataset=None ):
     val_loader = DataLoader( TensorDataset( torch.arange( n_users ).reshape( -1, 1 ) ), batch_size=32, shuffle=False, num_workers=1 )
 
     optimizer = Adagrad( params=model.parameters(), lr=config['lr'] )
+
+    if checkpoint_dir:
+        model_state, optimizer_state = torch.load(
+            os.path.join(checkpoint_dir, "checkpoint"))
+        model.load_state_dict(model_state)
+        optimizer.load_state_dict(optimizer_state)
 
     for epoch in range( 10 ):
         for i, interact in enumerate( loader ):
@@ -74,16 +104,28 @@ def train_model( config, dataset=None ):
                 loss.backward()
                 optimizer.step()
 
-    result = torch.zeros( ( 0, 1000 ) )
-    for idx, batch in enumerate( val_loader ):
-        res, _, _, _ = model( batch[0][:,0], torch.arange( n_items ), is_test=True  )
-        _, indices = torch.topk( res, k=1000, dim=-1 )
-        result = torch.vstack( ( result, indices ) )
+        result = torch.zeros( ( 0, n_items ) )
+        for idx, batch in enumerate( val_loader ):
+            res, _, _, _ = model( batch[0][:,0], torch.arange( n_items ), is_test=True  )
+            result = torch.vstack( ( result, res ) )
 
-    torch.save( result, f'{hash( str(config) )}_predict.pt' )
+        val_mask, val_score = dataset.get_val()
+        result[ ~val_mask ] = - np.inf
+        hr, recall, ndcg = evaluate( val_score, result, 20, 100, 500 )
 
+        tune.report( {
+            'hr' : hr.item(),
+            'recall' : recall.item(),
+            'ndcg' : ndcg.item()
+        } )
+
+        with tune.checkpoint_dir(epoch) as checkpoint_dir:
+            path = os.path.join(checkpoint_dir, "checkpoint")
+            torch.save((model.state_dict(), optimizer.state_dict()), path)
+
+    
 if __name__ == '__main__':
-    ray.init( num_cpus=1,  _temp_dir='.' )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/' )
     dataset = ray.put( Dataset( './process_datasets/pantip_dataset/user_interact_window_1_window_2.pt', batch_size=32 ) )
 
     config = {
@@ -104,15 +146,23 @@ if __name__ == '__main__':
 
         # fix parameter
         'relation' : 'rooms',
-        'hr_k' : 20,
-        'recall_k' : 20,
-        'ndcg_k' : 100
     }
+
+
+    reporter = CLIReporter( [ 'hr', 'recall', 'ndcg' ], [ 'num_group', 'gamma' ] )
+    scheduler = ASHAScheduler(
+        metric='recall',
+        mode='max',
+        max_t=256,
+        grace_period=1,
+        reduction_factor=2
+    )
+
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
         resources_per_trial={ 'cpu' : 1 },
-        mode='max',
-        num_samples=5,
+        progress_reporter=reporter,
+        num_samples=100,
         verbose=1,
         config=config,
         name=f'pantip_dataset_rooms',
