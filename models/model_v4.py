@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
+from ml1m_dataset import Ml1mDataset as Dataset
+from torch.utils.data import DataLoader
 
 class GCN( MessagePassing ):
     def __init__( self, in_dim, out_dim, n, m ):
@@ -211,6 +213,16 @@ class KldivModel( nn.Module ):
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
         self.kl_div = GMMKlDiv()
 
+    def kl_div_to_normal_gauss( self, gauss ):
+        category_mu, category_sigma = torch.hsplit( gauss, 2 )
+
+        return 0.5 * (
+            torch.sum( torch.square( category_mu ), dim=-1 ) \
+            + torch.sum( category_sigma, dim=-1 ) \
+            - self.num_latent \
+            - torch.log( torch.prod( category_sigma, dim=-1 ) )
+        )
+
     def forward( self, idx1, idx2, relation ):
        mixture_1, mixture_2 = None, None
 
@@ -219,7 +231,7 @@ class KldivModel( nn.Module ):
            mixture_2 = self.user_mixture( idx2 )
            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
 
-           return self.kl_div( mixture_1, mixture_2, user_gaussian, user_gaussian )
+           return self.kl_div( mixture_1, mixture_2, user_gaussian, user_gaussian ), self.kl_div_to_normal_gauss( user_gaussian )
 
        elif relation == 'user-item':
            mixture_1 = self.user_mixture( idx1 )
@@ -227,8 +239,8 @@ class KldivModel( nn.Module ):
 
            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
            item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
-          
-           return self.kl_div( mixture_1, mixture_2, user_gaussian, item_gaussian )
+
+           return self.kl_div( mixture_1, mixture_2, user_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( torch.vstack( ( user_gaussian, item_gaussian ) ) )
 
        elif relation == 'item-item':
            mixture_1 = self.item_mixture( idx1 )
@@ -236,14 +248,15 @@ class KldivModel( nn.Module ):
 
            item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-           return self.kl_div( mixture_1, mixture_2, item_gaussian, item_gaussian )
+           return self.kl_div( mixture_1, mixture_2, item_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( item_gaussian )
 
 if __name__ == '__main__':
    dataset = Dataset( 'item_genre' )
    model = KldivModel( dataset.n_users, dataset.n_items, 4, 4, 32 )
-   for idx, batch in enumerate( dataset ):
-       sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
-       res = model( sample_users, sample_users, 'user-user' )
+   for idx, batch in enumerate( DataLoader( dataset ) ):
+       print( batch )
+       pos_interact, neg_interact = batch
+       res = model( pos_interact[:,0], pos_interact[:,1], 'user-item' )
        print( res )
        break
 
