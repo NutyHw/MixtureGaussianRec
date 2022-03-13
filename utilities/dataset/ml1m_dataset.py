@@ -78,7 +78,7 @@ class Ml1mDataset( Dataset ):
             user_ids = torch.full( ( int( num_interact[uid].item() ), 1 ), uid )
             neg_interact = torch.vstack( ( neg_interact, torch.hstack( ( user_ids, item_ids ) ) ) )
 
-        self.neg_interact = neg_interact
+        self.neg_interact = neg_interact.to( torch.long )
         self.pos_interact = self.train_adj_mat.nonzero()
 
 if __name__ == '__main__':
