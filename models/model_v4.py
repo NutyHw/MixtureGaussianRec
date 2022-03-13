@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
+from ml1m_dataset import Ml1mDataset as Dataset
 
 class GCN( MessagePassing ):
     def __init__( self, in_dim, out_dim, n, m ):
@@ -67,16 +68,10 @@ class EmbeddingGCN( nn.Module ):
         return torch.softmax( x, dim=-1 )
 
 class GaussianEmbedding( nn.Module ):
-    def __init__( self, num_latent, n, mean_constraint, sigma_min, sigma_max ):
+    def __init__( self, num_latent, n ):
         super().__init__()
-        self.mean_constraint = mean_constraint
-        self.sigma_min, self.sigma_max = sigma_min, sigma_max
         self.mu = nn.Embedding( num_embeddings=n, embedding_dim=num_latent )
         self.sigma = nn.Embedding( num_embeddings=n, embedding_dim=num_latent )
-
-    def constraint_distribution( self ):
-        self.mu.weight.clamp_( - ( self.mean_constraint ** 0.5 ), self.mean_constraint ** 0.5 )
-        self.sigma.weight.clamp_( math.log( self.sigma_min ), math.log( self.sigma_max ) )
 
     def init_xavior( self ):
         nn.init.xavier_uniform( self.mu.weight )
@@ -91,6 +86,47 @@ class MixtureEmbedding( nn.Module ):
     
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
+
+class GMMKlDiv( nn.Module ):
+    def __init__( self ):
+        super().__init__()
+
+    def compute_kl_div( self, p : torch.Tensor, q : torch.Tensor):
+        mu_p, sigma_p = torch.hsplit( p, 2 )
+        mu_q, sigma_q = torch.hsplit( q, 2 )
+
+        num_latent  = mu_p.shape[1]
+
+        mu_p, sigma_p = mu_p.unsqueeze( dim=0 ), sigma_p.unsqueeze( dim=0 )
+        mu_q, sigma_q = mu_q.unsqueeze( dim=1 ), sigma_q.unsqueeze( dim=1 )
+
+
+        log_sigma = torch.log( 
+            torch.prod( sigma_q, dim=-1 ) \
+            / torch.prod( sigma_p, dim=-1 )
+        )
+        trace_sigma = torch.sum( ( 1 / sigma_q ) * sigma_p, dim=-1 )
+
+        sum_mu_sigma = torch.sum( torch.square( mu_p - mu_q ) * ( 1 / sigma_q ), dim=-1 )
+
+        return 0.5 * ( log_sigma + trace_sigma - num_latent + sum_mu_sigma ).T
+
+    def compute_mixture_kl_div( self, k1, k2, kl_div_mat, kl_div_mat2 ):
+        mixture1, mixture2 = k1, k2
+        kl_div_mat = torch.exp( - kl_div_mat )
+        kl_div_mat2 = torch.exp( - kl_div_mat2 )
+
+        return torch.sum(
+            mixture1.unsqueeze( dim=2 ) * torch.log( 
+                torch.matmul( mixture1, kl_div_mat.T ).unsqueeze( dim=1 ) / torch.matmul( mixture2, kl_div_mat2.T ).unsqueeze( dim=0 )
+            ).transpose( dim0=1, dim1=2 )
+        ,dim=1 )
+
+    def forward( self, k1, k2, p, q ):
+        kl_div_mat = self.compute_kl_div( p, p )
+        kl_div_mat2 = self.compute_kl_div( p, q )
+
+        return self.compute_mixture_kl_div( k1, k2, kl_div_mat, kl_div_mat2 )
 
 class GmmExpectedKernel( nn.Module ):
     def __init__( self ):
@@ -120,49 +156,88 @@ class GmmExpectedKernel( nn.Module ):
         gaussian_mat = self.compute_gaussian_expected_likehood( p, q )
         return self.compute_mixture_gaussian_expected_likehood( k1, k2, gaussian_mat )
 
-class Model( nn.Module ):
-    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent, mean_constraint, sigma_min, sigma_max ):
+#class ExpectedKernelModel( nn.Module ):
+#    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent, mean_constraint, sigma_min, sigma_max ):
+#        super().__init__()
+#        self.num_user_mixture  = user_mixture
+#        self.num_item_mixture = item_mixture
+#        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture, mean_constraint, sigma_min, sigma_max )
+#        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture, mean_constraint, sigma_min, sigma_max )
+#        self.user_mixture = MixtureEmbedding( user_mixture, n_users )
+#        self.item_mixture = MixtureEmbedding( item_mixture, n_items )
+#        self.expected_likehood_kernel = GmmExpectedKernel()
+#
+#    def forward( self, idx1, idx2, relation ):
+#        mixture_1, mixture_2 = None, None
+#
+#        if relation == 'user-user':
+#            mixture_1 =  self.user_mixture( idx1 )
+#            mixture_2 = self.user_mixture( idx2 )
+#            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+#
+#            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, user_gaussian )
+#
+#        elif relation == 'user-item':
+#            mixture_1 = self.user_mixture( idx1 )
+#            mixture_2 = self.item_mixture( idx2 )
+#
+#            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+#            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
+#           
+#            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, item_gaussian )
+#
+#        elif relation == 'item-item':
+#            mixture_1 = self.item_mixture( idx1 )
+#            mixture_2 = self.item_mixture( idx2 )
+#
+#            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
+#
+#            return self.expected_likehood_kernel( mixture_1, mixture_2, item_gaussian, item_gaussian )
+
+class KldivModel( nn.Module ):
+    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent ):
         super().__init__()
         self.num_user_mixture  = user_mixture
         self.num_item_mixture = item_mixture
-        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture, mean_constraint, sigma_min, sigma_max )
-        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture, mean_constraint, sigma_min, sigma_max )
+        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture )
+        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
         self.user_mixture = MixtureEmbedding( user_mixture, n_users )
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
-        self.expected_likehood_kernel = GmmExpectedKernel()
+        self.kl_div = GMMKlDiv()
 
     def forward( self, idx1, idx2, relation ):
-        mixture_1, mixture_2 = None, None
+       mixture_1, mixture_2 = None, None
 
-        if relation == 'user-user':
-            mixture_1 =  self.user_mixture( idx1 )
-            mixture_2 = self.user_mixture( idx2 )
-            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+       if relation == 'user-user':
+           mixture_1 =  self.user_mixture( idx1 )
+           mixture_2 = self.user_mixture( idx2 )
+           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
 
-            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, user_gaussian )
+           return self.kl_div( mixture_1, mixture_2, user_gaussian, user_gaussian )
 
-        elif relation == 'user-item':
-            mixture_1 = self.user_mixture( idx1 )
-            mixture_2 = self.item_mixture( idx2 )
+       elif relation == 'user-item':
+           mixture_1 = self.user_mixture( idx1 )
+           mixture_2 = self.item_mixture( idx2 )
 
-            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
-            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
-           
-            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, item_gaussian )
+           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
+          
+           return self.kl_div( mixture_1, mixture_2, user_gaussian, item_gaussian )
 
-        elif relation == 'item-item':
-            mixture_1 = self.item_mixture( idx1 )
-            mixture_2 = self.item_mixture( idx2 )
+       elif relation == 'item-item':
+           mixture_1 = self.item_mixture( idx1 )
+           mixture_2 = self.item_mixture( idx2 )
 
-            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
+           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-            return self.expected_likehood_kernel( mixture_1, mixture_2, item_gaussian, item_gaussian )
+           return self.kl_div( mixture_1, mixture_2, item_gaussian, item_gaussian ), 
 
-
-#if __name__ == '__main__':
-#    dataset = Dataset( 'item_genre' )
-#    model = Model( dataset.n_users, dataset.n_items, 4, 32, 10, 0.1, 5 )
-#    for idx, batch in enumerate( dataset ):
-#        sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
-#        model( sample_users, sample_users, 'user-user' )
+if __name__ == '__main__':
+   dataset = Dataset( 'item_genre' )
+   model = KldivModel( dataset.n_users, dataset.n_items, 4, 4, 32 )
+   for idx, batch in enumerate( dataset ):
+       sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
+       res = model( sample_users, sample_users, 'user-user' )
+       print( res )
+       break
 

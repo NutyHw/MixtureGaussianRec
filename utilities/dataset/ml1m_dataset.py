@@ -1,8 +1,8 @@
 import os
 import torch
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 
-class Ml1mDataset( IterableDataset ):
+class Ml1mDataset( Dataset ):
     def __init__( self, relation ):
         self.relation = relation
         self.dataset_dir = './process_datasets/ml-1m/'
@@ -12,10 +12,13 @@ class Ml1mDataset( IterableDataset ):
 
         self.n_users, self.n_items = self.adj_mat.shape
         self.user_sim, self.item_sim = self.compute_confidence_mat()
+        self.samples()
 
+    def __len__( self ):
+        return self.pos_interact.shape[0]
 
-    def __iter__( self ):
-        return self.samples( 32 )
+    def __getitem__( self, idx ):
+        return self.pos_interact[ idx ], self.neg_interact[ idx ]
 
     def get_val( self ):
         return self.val_mask > 0, self.adj_mat * self.val_mask
@@ -66,27 +69,22 @@ class Ml1mDataset( IterableDataset ):
 
         self.train_adj_mat = self.adj_mat * self.train_mask
 
-    def samples( self, batch_size ):
-        shuffle_users = torch.randperm( self.n_users )
-        for i in range( 0, self.n_users, batch_size ):
-            end_idx = i + batch_size if i + batch_size < self.n_users else self.n_users
-            sample_users = shuffle_users[ i : end_idx ]
+    def samples( self ):
+        num_interact = torch.sum( self.train_adj_mat, dim=-1 )
+        neg_interact = torch.zeros( ( 0, 2 ) )
 
-            pos_sample_item = torch.flatten( torch.multinomial( self.train_adj_mat[ sample_users ], num_samples=1 ) )
-            neg_sample_item = torch.flatten( torch.multinomial( 1 - self.train_adj_mat[ sample_users ], num_samples=1 ) )
+        for uid in range( self.n_users ):
+            item_ids = torch.multinomial( 1 - self.train_adj_mat[ uid ], num_samples=int( num_interact[ uid ].item() ) ).reshape( -1, 1 )
+            user_ids = torch.full( ( int( num_interact[uid].item() ), 1 ), uid )
+            neg_interact = torch.vstack( ( neg_interact, torch.hstack( ( user_ids, item_ids ) ) ) )
 
-            unique_items, inverse = torch.unique( torch.hstack( ( pos_sample_item, neg_sample_item ) ), return_inverse=True, sorted=True )
-
-            comb_user = torch.combinations( sample_users, r=2 )
-            comb_item = torch.combinations( unique_items, r=2 )
-
-            user_sim = self.user_sim[ comb_user[:,0], comb_user[:,1] ]
-            item_sim = self.item_sim[ comb_item[:,0], comb_item[:,1] ]
-
-            yield sample_users, unique_items, user_sim, item_sim, inverse[ : sample_users.shape[0] ], inverse[ sample_users.shape[0] : ]
+        self.neg_interact = neg_interact
+        self.pos_interact = self.train_adj_mat.nonzero()
 
 if __name__ == '__main__':
     dataset = Ml1mDataset( 'item_genre' )
-    for i, batch in enumerate( dataset ):
-        print( i, batch )
+    loader = DataLoader( dataset )
+    for i, batche in enumerate( loader ):
+        print( batche )
+        break
 
