@@ -1,8 +1,8 @@
 import os
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 
-class Ml1mDataset( Dataset ):
+class Ml1mDataset( IterableDataset ):
     def __init__( self, relation ):
         self.relation = relation
         self.dataset_dir = './process_datasets/ml-1m/'
@@ -11,12 +11,11 @@ class Ml1mDataset( Dataset ):
         self.apply_mask()
 
         self.n_users, self.n_items = self.adj_mat.shape
+        self.user_sim, self.item_sim = self.compute_confidence_mat()
 
-    def __len__( self ):
-        return self.n_users
 
-    def __getitem__( self, idx ):
-        return idx, self.train_adj_mat[ idx ], self.confidence_mat[ self.relation ][ idx ]
+    def __iter__( self ):
+        return self.samples( 20, 20 )
 
     def get_val( self ):
         return self.val_mask > 0, self.adj_mat * self.val_mask
@@ -24,8 +23,29 @@ class Ml1mDataset( Dataset ):
     def get_test( self ):
         return self.test_mask > 0, self.adj_mat * self.test_mask
 
-    def get_reg_mat( self ):
-        return self.interact[ self.relation ].T
+    def compute_metapath_sim( self, commute ):
+        diag = torch.diag( commute ).reshape( 1, -1 ) + torch.diag( commute ).reshape( -1, 1 )
+        return 2 * commute / diag
+
+    def compute_confidence_mat( self ):
+        user_commute = None
+        item_commute = None
+        if self.relation == 'item_genre':
+            user_commute = torch.linalg.multi_dot( ( self.train_adj_mat, self.interact[ self.relation ].T, self.interact[ self.relation ], self.train_adj_mat.T ) )
+            item_commute = torch.linalg.multi_dot( ( self.interact[ self.relation ].T, self.interact[ self.relation ] ) )
+
+
+        elif self.relation == 'user_age' or self.relation == 'usre_jobs':
+            item_commute = torch.linalg.multi_dot( ( self.train_adj_mat.T, self.interact[ self.relation ].T, self.interact[ self.relation ], self.train_adj_mat ) )
+            user_commute = torch.linalg.multi_dot( ( self.interact[ self.relation ].T, self.interact[ self.relation ] ) )
+
+        user_sim = self.compute_metapath_sim( user_commute )
+        item_sim = self.compute_metapath_sim( item_commute )
+
+        user_sim[ torch.arange( self.n_users ), torch.arange( self.n_users ) ]  = 0
+        item_sim[ torch.arange( self.n_items ), torch.arange( self.n_items ) ]  = 0
+
+        return user_sim, item_sim
 
     def apply_mask( self ):
         mask = torch.sum( self.interact[ 'item_genre' ].T, dim=-1 ) > 0
@@ -42,11 +62,30 @@ class Ml1mDataset( Dataset ):
         self.val_mask = torch.load( os.path.join( self.dataset_dir, 'val_mask.pt' ) )
         self.test_mask = torch.load( os.path.join( self.dataset_dir, 'test_mask.pt' ) )
         self.interact = torch.load( os.path.join( self.dataset_dir, 'interact.pt' ) )
-        self.confidence_mat = torch.load( os.path.join( self.dataset_dir, 'sim_relation_mat.pt' ) )
 
         self.train_adj_mat = self.adj_mat * self.train_mask
 
+    def samples( self, num_sample, sample_size ):
+        for i in range( num_sample ):
+            sample_users = torch.unique( torch.randint( self.n_users, ( sample_size, ) ), sorted=True )
+
+            pos_sample_item = torch.flatten( torch.multinomial( self.train_adj_mat[ sample_users ], num_samples=1 ) )
+            neg_sample_item = torch.flatten( torch.multinomial( 1 - self.train_adj_mat[ sample_users ], num_samples=1 ) )
+
+            unique_items, inverse = torch.unique( torch.hstack( ( pos_sample_item, neg_sample_item ) ), return_inverse=True, sorted=True )
+
+            comb_user = torch.combinations( sample_users, r=2 )
+            comb_item = torch.combinations( unique_items, r=2 )
+
+            user_sim = self.user_sim[ comb_user[:,0], comb_user[:,1] ]
+            item_sim = self.item_sim[ comb_item[:,0], comb_item[:,1] ]
+
+            yield sample_users, unique_items, 1 - user_sim, 1 - item_sim, inverse[ : sample_users.shape[0] ], inverse[ sample_users.shape[0] : ]
+
+
 if __name__ == '__main__':
     dataset = Ml1mDataset( 'item_genre' )
-    print( dataset.n_users, dataset.n_items )
-    print( dataset.get_reg_mat().shape )
+    for idx, batch in enumerate( dataset ):
+        sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
+        print( pos_inverse, neg_inverse )
+        break
