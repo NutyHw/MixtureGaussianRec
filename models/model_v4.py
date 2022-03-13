@@ -215,11 +215,12 @@ class KldivModel( nn.Module ):
 
     def kl_div_to_normal_gauss( self, gauss ):
         category_mu, category_sigma = torch.hsplit( gauss, 2 )
+        num_latent = category_mu.shape[1]
 
         return 0.5 * (
             torch.sum( torch.square( category_mu ), dim=-1 ) \
             + torch.sum( category_sigma, dim=-1 ) \
-            - self.num_latent \
+            - num_latent \
             - torch.log( torch.prod( category_sigma, dim=-1 ) )
         )
 
