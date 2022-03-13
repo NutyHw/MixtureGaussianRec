@@ -1,6 +1,6 @@
 import os
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 
 class Ml1mDataset( IterableDataset ):
     def __init__( self, relation ):
@@ -15,7 +15,7 @@ class Ml1mDataset( IterableDataset ):
 
 
     def __iter__( self ):
-        return self.samples( 20, 20 )
+        return self.samples( 32 )
 
     def get_val( self ):
         return self.val_mask > 0, self.adj_mat * self.val_mask
@@ -30,6 +30,7 @@ class Ml1mDataset( IterableDataset ):
     def compute_confidence_mat( self ):
         user_commute = None
         item_commute = None
+
         if self.relation == 'item_genre':
             user_commute = torch.linalg.multi_dot( ( self.train_adj_mat, self.interact[ self.relation ].T, self.interact[ self.relation ], self.train_adj_mat.T ) )
             item_commute = torch.linalg.multi_dot( ( self.interact[ self.relation ].T, self.interact[ self.relation ] ) )
@@ -65,9 +66,11 @@ class Ml1mDataset( IterableDataset ):
 
         self.train_adj_mat = self.adj_mat * self.train_mask
 
-    def samples( self, num_sample, sample_size ):
-        for i in range( num_sample ):
-            sample_users = torch.unique( torch.randint( self.n_users, ( sample_size, ) ), sorted=True )
+    def samples( self, batch_size ):
+        shuffle_users = torch.randperm( self.n_users )
+        for i in range( 0, self.n_users, batch_size ):
+            end_idx = i + batch_size if i + batch_size < self.n_users else self.n_users
+            sample_users = shuffle_users[ i : end_idx ]
 
             pos_sample_item = torch.flatten( torch.multinomial( self.train_adj_mat[ sample_users ], num_samples=1 ) )
             neg_sample_item = torch.flatten( torch.multinomial( 1 - self.train_adj_mat[ sample_users ], num_samples=1 ) )
@@ -80,12 +83,10 @@ class Ml1mDataset( IterableDataset ):
             user_sim = self.user_sim[ comb_user[:,0], comb_user[:,1] ]
             item_sim = self.item_sim[ comb_item[:,0], comb_item[:,1] ]
 
-            yield sample_users, unique_items, 1 - user_sim, 1 - item_sim, inverse[ : sample_users.shape[0] ], inverse[ sample_users.shape[0] : ]
-
+            yield sample_users, unique_items, user_sim, item_sim, inverse[ : sample_users.shape[0] ], inverse[ sample_users.shape[0] : ]
 
 if __name__ == '__main__':
     dataset = Ml1mDataset( 'item_genre' )
-    for idx, batch in enumerate( dataset ):
-        sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
-        print( pos_inverse, neg_inverse )
-        break
+    for i, batch in enumerate( dataset ):
+        print( i, batch )
+

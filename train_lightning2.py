@@ -1,6 +1,6 @@
 import os
 import json 
-import random
+import numpy as np
 from functools import partial
 
 import torch
@@ -17,8 +17,6 @@ import ray
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
-from ray.tune.suggest import ConcurrencyLimiter
-from ray.tune.suggest.bayesopt import BayesOptSearch
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
@@ -31,7 +29,7 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
 
-        self.model = Model( self.n_users, self.n_items, config['num_mixture'], config['num_latent'] )
+        self.model = Model( self.n_users, self.n_items, config['num_mixture'], config['num_mixture'], config['num_latent'], config['mean_constraint'], config['sigma_min'], config['sigma_max'] )
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
 
     def train_dataloader( self ):
@@ -64,32 +62,39 @@ class ModelTrainer( pl.LightningModule ):
 
     def training_step( self, batch, batch_idx ):
         sample_users, unique_items, user_sim, item_sim, pos_inverse, neg_inverse = batch
+        sample_users, unique_items = sample_users.squeeze(dim=0), unique_items.squeeze(dim=0)
+        user_sim, item_sim = user_sim.squeeze(dim=0), item_sim.squeeze(dim=0)
+        pos_inverse, neg_inverse = pos_inverse.squeeze(dim=0), neg_inverse.squeeze(dim=0)
 
         user_user_sim = self.model( sample_users, sample_users, 'user-user' )
         user_item_sim = self.model( sample_users, unique_items, 'user-item' )
         item_item_sim = self.model( unique_items, unique_items, 'item-item' )
 
-        user_user_sim = torch.triu( user_user_sim, diagonal=1 ).reshape( -1, 1 )
-        item_item_sim = torch.triu( item_item_sim, diagonal=1 ).reshape( -1, 1 )
+        user_user_triu_indices = torch.triu_indices( user_user_sim.shape[0], user_user_sim.shape[1], offset=1 )
+        item_item_triu_indices = torch.triu_indices( item_item_sim.shape[0], item_item_sim.shape[1], offset=1 )
+
+        user_user_sim = user_user_sim[ user_user_triu_indices[0], user_user_triu_indices[1] ].reshape( -1, 1 )
+        item_item_sim = item_item_sim[ item_item_triu_indices[0], item_item_triu_indices[1] ].reshape( -1, 1 )
 
         pos_user_item_sim = user_item_sim[ torch.arange( sample_users.shape[0] ), pos_inverse ].reshape( -1, 1 )
         neg_user_item_sim = user_item_sim[ torch.arange( sample_users.shape[0] ), neg_inverse ].reshape( -1, 1 )
 
-        inner_cluster_loss = - ( user_user_sim * user_sim + item_item_sim * item_sim )
+        inner_cluster_loss = - ( torch.mean( user_user_sim * user_sim.reshape(-1,1) ) + torch.mean( item_item_sim * item_sim.reshape(-1,1) ) )
         ranking_loss = self.prediction_loss( pos_user_item_sim, neg_user_item_sim, torch.ones( ( pos_user_item_sim.shape[0], 1 ) ) )
 
-        return inner_cluster_loss + ranking_loss
+        loss = ranking_loss + inner_cluster_loss
+        return loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
+        self.y_pred[ ~val_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -103,14 +108,15 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        torch.save( self.y_pred, 'test_ml1m_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -119,13 +125,12 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        limit_train_batches=1,
-        max_epochs=1, 
+        max_epochs=256, 
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -165,21 +170,20 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=1,  _temp_dir='.' )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/' )
     dataset = ray.put( Dataset( 'item_genre' ) )
-    print( dataset )
     config = {
         # parameter to find
-        'num_latent' : 32,
+        'num_latent' : 64,
 
         # hopefully will find right parameter
-        'num_mixture' : 4,
-        'prediction_margin' : tune.uniform( 1, 4 ),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
-        'lr' : 1e-3,
-        'mean_constraint' : tune.uniform( 2, 100 ),
-        'sigma_min' : tune.uniform( 0.1, 0.5 ),
-        'sigma_max' : tune.uniform( 1, 5 ),
+        'num_mixture' : tune.grid_search([ 4, 8, 12, 16, 20 ]),
+        'prediction_margin' : tune.grid_search([ 1, 2, 4 ]) ,
+        'lr' : 1e-2,
+        'gamma' : 1e-5,
+        'mean_constraint' : 10,
+        'sigma_min' : 0.05,
+        'sigma_max' : 5,
 
         # fix parameter
         'relation' : relation,
@@ -189,25 +193,25 @@ def tune_population_based( relation : str ):
     }
 
     scheduler = ASHAScheduler(
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=1,
         verbose=1,
+        num_samples=1,
         config=config,
         scheduler=scheduler,
         name=f'ml1m_dataset_{relation}',
         keep_checkpoints_num=2,
-        local_dir=f".",
+        local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( 'rooms' )
+    tune_population_based( 'item_genre' )

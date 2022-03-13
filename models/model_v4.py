@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_sparse import transpose
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
@@ -122,27 +121,48 @@ class GmmExpectedKernel( nn.Module ):
         return self.compute_mixture_gaussian_expected_likehood( k1, k2, gaussian_mat )
 
 class Model( nn.Module ):
-    def __init__( self, n_users, n_items, n_mixture, num_latent, mean_constraint, sigma_min, sigma_max ):
-        self.num_global = n_mixture
-        self.global_gaussian = GaussianEmbedding( num_latent, n_mixture, mean_constraint, sigma_min, sigma_max )
-        self.user_mixture = MixtureEmbedding( n_mixture, n_users )
-        self.item_mixture = MixtureEmbedding( n_mixture, n_items )
+    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent, mean_constraint, sigma_min, sigma_max ):
+        super().__init__()
+        self.num_user_mixture  = user_mixture
+        self.num_item_mixture = item_mixture
+        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture, mean_constraint, sigma_min, sigma_max )
+        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture, mean_constraint, sigma_min, sigma_max )
+        self.user_mixture = MixtureEmbedding( user_mixture, n_users )
+        self.item_mixture = MixtureEmbedding( item_mixture, n_items )
         self.expected_likehood_kernel = GmmExpectedKernel()
 
     def forward( self, idx1, idx2, relation ):
-        global_gaussian = self.global_gaussian( torch.arange( self.num_global ) )
         mixture_1, mixture_2 = None, None
 
         if relation == 'user-user':
-           mixture_1 =  self.user_mixture( idx1 )
-           mixture_2 = self.user_mixture( idx2 )
+            mixture_1 =  self.user_mixture( idx1 )
+            mixture_2 = self.user_mixture( idx2 )
+            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+
+            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, user_gaussian )
 
         elif relation == 'user-item':
-           mixture_1 = self.user_mixture( idx1 )
-           mixture_2 = self.item_mixture( idx2 )
+            mixture_1 = self.user_mixture( idx1 )
+            mixture_2 = self.item_mixture( idx2 )
+
+            user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
+           
+            return self.expected_likehood_kernel( mixture_1, mixture_2, user_gaussian, item_gaussian )
 
         elif relation == 'item-item':
             mixture_1 = self.item_mixture( idx1 )
             mixture_2 = self.item_mixture( idx2 )
 
-        return self.expected_likehood_kernel( mixture_1, mixture_2, global_gaussian, global_gaussian )
+            item_gaussian = self.user_gaussian( torch.arange( self.num_item_mixture ) )
+
+            return self.expected_likehood_kernel( mixture_1, mixture_2, item_gaussian, item_gaussian )
+
+
+#if __name__ == '__main__':
+#    dataset = Dataset( 'item_genre' )
+#    model = Model( dataset.n_users, dataset.n_items, 4, 32, 10, 0.1, 5 )
+#    for idx, batch in enumerate( dataset ):
+#        sample_users, unique_items, user_dist, item_dist, pos_inverse, neg_inverse = batch   
+#        model( sample_users, sample_users, 'user-user' )
+
