@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
-from ml1m_dataset import Ml1mDataset as Dataset
 from torch.utils.data import DataLoader
 
 class GCN( MessagePassing ):

@@ -6,7 +6,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_v4 import GMMKlDiv as Model
+from models.model_v4 import KldivModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -66,41 +66,40 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         pos_interact, neg_interact = batch
 
-        unique_user, inverse_user = torch.unique( pos_interact[:,0], return_inverse=True, sorted=True )
-        unique_item, inverse_item = torch.unique( torch.hstack( ( pos_interact[:,1], neg_interact[:,1] ) ), return_inverse=True, sorted=True )
+        unique_user, inverse_user = torch.unique( pos_interact[:,0], return_inverse=True )
+        unique_item, inverse_item = torch.unique( torch.hstack( ( pos_interact[:,1], neg_interact[:,1] ) ), return_inverse=True )
 
         pos_inverse, neg_inverse = torch.hsplit( inverse_item, 2 )
 
-        user_user_sim = self.model( unique_user, unique_user, 'user-user' )
-        user_item_sim = self.model( unique_user, unique_item, 'user-item' )
-        item_item_sim = self.model( unique_item, unique_item, 'item-item' )
+        #user_user_sim = self.model( unique_user, unique_user, 'user-user' )
+        user_item_sim, kl_div = self.model( unique_user, unique_item, 'user-item' )
+        #item_item_sim = self.model( unique_item, unique_item, 'item-item' )
 
-        user_user_triu_indices = torch.triu_indices( user_user_sim.shape[0], user_user_sim.shape[1], offset=1 )
-        item_item_triu_indices = torch.triu_indices( item_item_sim.shape[0], item_item_sim.shape[1], offset=1 )
+        #user_user_triu_indices = torch.triu_indices( user_user_sim.shape[0], user_user_sim.shape[1], offset=1 )
+        #item_item_triu_indices = torch.triu_indices( item_item_sim.shape[0], item_item_sim.shape[1], offset=1 )
 
-        user_user_sim = user_user_sim[ user_user_triu_indices[0], user_user_triu_indices[1] ].reshape( -1, 1 )
-        item_item_sim = item_item_sim[ item_item_triu_indices[0], item_item_triu_indices[1] ].reshape( -1, 1 )
+        #user_user_sim = user_user_sim[ user_user_triu_indices[0], user_user_triu_indices[1] ].reshape( -1, 1 )
+        #item_item_sim = item_item_sim[ item_item_triu_indices[0], item_item_triu_indices[1] ].reshape( -1, 1 )
 
-        pos_user_item_sim = user_item_sim[ torch.arange( unique_user.shape[0] ), pos_inverse ].reshape( -1, 1 )
-        neg_user_item_sim = user_item_sim[ torch.arange( unique_user.shape[0] ), neg_inverse ].reshape( -1, 1 )
+        pos_user_item_sim = user_item_sim[ inverse_user, pos_inverse ].reshape( -1, 1 )
+        neg_user_item_sim = user_item_sim[ inverse_user, neg_inverse ].reshape( -1, 1 )
 
         ranking_loss = self.prediction_loss( pos_user_item_sim, neg_user_item_sim, torch.ones( ( pos_user_item_sim.shape[0], 1 ) ) )
 
-        user_comb = torch.combinations( unique_user, r=2 )
-        item_comb = torch.combinations( unique_item, r=2 )
+        #user_comb = torch.combinations( unique_user, r=2 )
+        #item_comb = torch.combinations( unique_item, r=2 )
 
-        inner_cluster_loss = torch.mean( user_user_sim * self.user_sim[ user_comb ].reshape( -1, 1 ) ) + torch.mean( item_item_sim * self.item_sim[ item_comb ].reshape( -1, 1 ) )
+        #inner_cluster_loss = torch.mean( user_user_sim * self.user_sim[ user_comb[:,0], user_comb[:,1] ].reshape( -1, 1 ) ) + torch.mean( item_item_sim * self.item_sim[ item_comb[:,0], item_comb[:,1] ].reshape( -1, 1 ) )
 
-        loss = ranking_loss + inner_cluster_loss
-        print( loss )
+        loss = ranking_loss #+ inner_cluster_loss
 
-        return loss
+        return loss + self.config['gamma'] * torch.sum( kl_div )
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
+        res, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
@@ -136,7 +135,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -181,7 +180,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=2,  _temp_dir='/data2/saito/' )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/' )
     dataset = ray.put( Dataset( 'item_genre' ) )
     config = {
         # parameter to find
@@ -193,9 +192,6 @@ def tune_population_based( relation : str ):
         'prediction_margin' : tune.grid_search([ 1, 2, 4 ]) ,
         'lr' : 1e-2,
         'gamma' : 1e-5,
-        'mean_constraint' : 10,
-        'sigma_min' : 0.05,
-        'sigma_max' : 5,
 
         # fix parameter
         'relation' : relation,
