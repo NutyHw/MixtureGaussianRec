@@ -296,26 +296,20 @@ class DistanceKlDiv( nn.Module ):
            - torch.log( torch.prod( gauss_sigma, dim=-1 ) )
        )
 
-    def forward( self, user_idx, item_idx, is_test=False ):
-        unique_user, inverse_user = torch.unique( user_idx, return_inverse=True )
-        unique_item, inverse_item = torch.unique( item_idx, return_inverse=True )
-
+    def forward( self, unique_user, unique_item ):
         global_gauss = self.global_gaussian( torch.arange( self.n_mixture ) )
         user_to_global = self.compute_kl_div( self.user_gaussian( unique_user ), global_gauss ) + self.compute_kl_div( global_gauss, self.user_gaussian( unique_user ) ).T
         global_to_item = self.compute_kl_div( self.item_gaussian( unique_item ), global_gauss ).T + self.compute_kl_div( global_gauss, self.item_gaussian( unique_item ) )
 
         user_item_dist =  user_to_global.unsqueeze( dim=2 ) + global_to_item.unsqueeze( dim=0 )
 
-        if is_test:
-            return torch.min( user_item_dist, dim=1 )[0].reshape( -1, 1 )
-
-        user_item_dist = user_item_dist[ inverse_user, :, inverse_item ]
+        result = torch.min( user_item_dist, dim=1 )[0]
 
         if self.attribute == 'user_attribute':
-            return torch.min( user_item_dist, dim=-1 )[0].reshape( -1, 1 ), unique_user, user_to_global
+            return result, unique_user, user_to_global
 
         elif self.attribute == 'item_attribute':
-            return torch.min( user_item_dist, dim=-1 )[0].reshape( -1, 1 ), unique_item, global_to_item.T
+            return result, unique_item, global_to_item.T
 
 if __name__ == '__main__':
    dataset = Dataset( 'item_genre' )

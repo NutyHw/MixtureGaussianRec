@@ -39,8 +39,8 @@ class ModelTrainer( pl.LightningModule ):
 
         self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_latent'], config['attribute']  )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
-        self.category_loss = nn.CrossEntropyLoss( reduction='sum' )
+        # self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
+        self.category_loss = nn.CrossEntropyLoss( reduction='mean' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -53,6 +53,9 @@ class ModelTrainer( pl.LightningModule ):
 
     def gibb_sampling( self, beta, dist ):
         return torch.softmax( - beta * dist, dim=-1 )
+
+    def negative_log_likehood( self, beta, pos_dist, context_dist ):
+        return pos_dist +  ( 1 / beta ) * torch.sum( torch.exp( - beta * context_dist ), dim=-1 ) 
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -77,11 +80,14 @@ class ModelTrainer( pl.LightningModule ):
         pos_interact, neg_interact = batch
 
         all_interact = torch.vstack( ( pos_interact, neg_interact ) )
-        dist, unique, category_dist = self.model( all_interact[:,0], all_interact[:,1] )
+        uniquer_user, inverse_user = torch.unique( all_interact[:,0], return_inverse=True )
+        uniquer_item, inverse_item = torch.unique( all_interact[:,1], return_inverse=True )
 
-        pos_dist, neg_dist = torch.vsplit( dist, 2 )
+        dist, unique, category_dist = self.model( uniquer_user, uniquer_item )
 
-        dist_loss = self.prediction_loss( neg_dist, pos_dist, torch.ones( ( pos_interact.shape[0], 1 ) ) )
+        pos_dist = dist[ inverse_user, inverse_item ]
+
+        dist_loss = torch.mean( self.negative_log_likehood( self.config['beta'], pos_dist, dist ) )
 
         category_prob = self.gibb_sampling( self.config['beta'], category_dist )
         category_loss = self.category_loss( category_prob, self.true_category[ unique ] )
@@ -89,13 +95,14 @@ class ModelTrainer( pl.LightningModule ):
         regularization = self.model.regularization()
 
         loss =  dist_loss + category_loss + self.config['weight_decay'] * torch.sum( regularization )
+
         return loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
         self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_validation_epoch_end( self ):
@@ -114,7 +121,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
         self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_test_epoch_end( self ):
