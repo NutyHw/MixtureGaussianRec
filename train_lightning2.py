@@ -1,3 +1,4 @@
+import sys
 import os
 import json 
 import numpy as np
@@ -6,7 +7,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_v4 import KldivModel as Model
+from models.model_v4 import DistanceKlDiv as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -36,10 +37,10 @@ class ModelTrainer( pl.LightningModule ):
         else:
             config['attribute'] = 'item_attribute'
 
-        self.model = Model( self.n_users, self.n_items, config['num_mixture'], config['num_latent'], config['attribute']  )
+        self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_latent'], config['attribute']  )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
-        self.category_loss = nn.CrossEntropyLoss( reduction='mean' )
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
+        self.category_loss = nn.CrossEntropyLoss( reduction='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -87,7 +88,8 @@ class ModelTrainer( pl.LightningModule ):
 
         regularization = self.model.regularization()
 
-        return dist_loss + category_loss + self.config['weight_decay'] * regularization
+        loss =  dist_loss + category_loss + self.config['weight_decay'] * torch.sum( regularization )
+        return loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
@@ -120,7 +122,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, 'test_ml1m_model.pt' )
+        torch.save( self.y_pred, f'test_ml1m_{self.config["relation"]}_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -129,13 +131,12 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1, 
-        limit_train_batches=1,
+        limit_train_batches=256,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -146,7 +147,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
         ],
         progress_bar_refresh_rate=0
     )
@@ -175,21 +176,18 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/' )
-    dataset = ray.put( Dataset( 'item_genre' ) )
+    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
+    dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
         'num_latent' : 64,
-        # 'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
-        'batch_size' : 256,
+        'batch_size' : tune.grid_search([ 256, 512, 1024 ]),
 
         # hopefully will find right parameter
-        # 'prediction_margin' : tune.grid_search([ 1, 2, 4 ]) ,
-        'prediction_margin' : 1,
-        # 'beta' : tune.grid_search([ 0.1, 1, 2, 4 ]),
-        'beta' : 1,
-        'weight_decay' : 1e-5,
-        'lr' : 1e-2,
+        'prediction_margin' : tune.grid_search([  1, 2, 4 ]) ,
+        'beta' : tune.grid_search([ 1, 2, 5 ]),
+        'weight_decay' : 1e-2,
+        'lr' : 1e-3,
 
         # fix parameter
         'relation' : relation,
@@ -206,7 +204,7 @@ def tune_population_based( relation : str ):
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1 },
         metric='ndcg_score',
         mode='max',
         verbose=1,
@@ -221,4 +219,4 @@ def tune_population_based( relation : str ):
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( 'item_genre' )
+    tune_population_based( sys.argv[1] )
