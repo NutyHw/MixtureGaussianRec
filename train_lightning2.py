@@ -29,11 +29,17 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
 
-        self.model = Model( self.n_users, self.n_items, config['num_mixture'], config['num_mixture'], config['num_latent']  )
+        self.true_category = self.dataset.get_reg_mat()
+
+        if self.true_category.shape[0] == self.n_users:
+            config['attribute'] = 'user_attribute'
+        else:
+            config['attribute'] = 'item_attribute'
+
+        self.model = Model( self.n_users, self.n_items, config['num_mixture'], config['num_latent'], config['attribute']  )
 
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
-        self.user_sim = self.dataset.user_sim
-        self.item_sim = self.dataset.item_sim
+        self.category_loss = nn.CrossEntropyLoss( reduction='mean' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -43,6 +49,9 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+
+    def gibb_sampling( self, beta, dist ):
+        return torch.softmax( - beta * dist, dim=-1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -66,41 +75,26 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         pos_interact, neg_interact = batch
 
-        unique_user, inverse_user = torch.unique( pos_interact[:,0], return_inverse=True )
-        unique_item, inverse_item = torch.unique( torch.hstack( ( pos_interact[:,1], neg_interact[:,1] ) ), return_inverse=True )
+        all_interact = torch.vstack( ( pos_interact, neg_interact ) )
+        dist, unique, category_dist = self.model( all_interact[:,0], all_interact[:,1] )
 
-        pos_inverse, neg_inverse = torch.hsplit( inverse_item, 2 )
+        pos_dist, neg_dist = torch.vsplit( dist, 2 )
 
-        #user_user_sim = self.model( unique_user, unique_user, 'user-user' )
-        user_item_sim, kl_div = self.model( unique_user, unique_item, 'user-item' )
-        #item_item_sim = self.model( unique_item, unique_item, 'item-item' )
+        dist_loss = self.prediction_loss( neg_dist, pos_dist, torch.ones( ( pos_interact.shape[0], 1 ) ) )
 
-        #user_user_triu_indices = torch.triu_indices( user_user_sim.shape[0], user_user_sim.shape[1], offset=1 )
-        #item_item_triu_indices = torch.triu_indices( item_item_sim.shape[0], item_item_sim.shape[1], offset=1 )
+        category_prob = self.gibb_sampling( self.config['beta'], category_dist )
+        category_loss = self.category_loss( category_prob, self.true_category[ unique ] )
 
-        #user_user_sim = user_user_sim[ user_user_triu_indices[0], user_user_triu_indices[1] ].reshape( -1, 1 )
-        #item_item_sim = item_item_sim[ item_item_triu_indices[0], item_item_triu_indices[1] ].reshape( -1, 1 )
+        regularization = self.model.regularization()
 
-        pos_user_item_sim = user_item_sim[ inverse_user, pos_inverse ].reshape( -1, 1 )
-        neg_user_item_sim = user_item_sim[ inverse_user, neg_inverse ].reshape( -1, 1 )
-
-        ranking_loss = self.prediction_loss( pos_user_item_sim, neg_user_item_sim, torch.ones( ( pos_user_item_sim.shape[0], 1 ) ) )
-
-        #user_comb = torch.combinations( unique_user, r=2 )
-        #item_comb = torch.combinations( unique_item, r=2 )
-
-        #inner_cluster_loss = torch.mean( user_user_sim * self.user_sim[ user_comb[:,0], user_comb[:,1] ].reshape( -1, 1 ) ) + torch.mean( item_item_sim * self.item_sim[ item_comb[:,0], item_comb[:,1] ].reshape( -1, 1 ) )
-
-        loss = ranking_loss #+ inner_cluster_loss
-
-        return loss + self.config['gamma'] * torch.sum( kl_div )
+        return dist_loss + category_loss + self.config['weight_decay'] * regularization
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -118,8 +112,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
@@ -135,12 +129,13 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=256, 
+        max_epochs=1, 
+        limit_train_batches=1,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -185,19 +180,23 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        # 'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'batch_size' : 256,
 
         # hopefully will find right parameter
-        'num_mixture' : tune.grid_search([ 4, 8, 12, 16, 20 ]),
-        'prediction_margin' : tune.grid_search([ 1, 2, 4 ]) ,
+        # 'prediction_margin' : tune.grid_search([ 1, 2, 4 ]) ,
+        'prediction_margin' : 1,
+        # 'beta' : tune.grid_search([ 0.1, 1, 2, 4 ]),
+        'beta' : 1,
+        'weight_decay' : 1e-5,
         'lr' : 1e-2,
-        'gamma' : 1e-5,
 
         # fix parameter
         'relation' : relation,
         'hr_k' : 1,
         'recall_k' : 10,
-        'ndcg_k' : 10
+        'ndcg_k' : 10,
+        'attribute' : 'item_attribute'
     }
 
     scheduler = ASHAScheduler(

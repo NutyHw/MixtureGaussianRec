@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 from torch.utils.data import DataLoader
+from ml1m_dataset import Ml1mDataset as Dataset
 
 class GCN( MessagePassing ):
     def __init__( self, in_dim, out_dim, n, m ):
@@ -201,62 +202,127 @@ class GmmExpectedKernel( nn.Module ):
 #
 #            return self.expected_likehood_kernel( mixture_1, mixture_2, item_gaussian, item_gaussian )
 
-class KldivModel( nn.Module ):
-    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent ):
-        super().__init__()
-        self.num_user_mixture  = user_mixture
-        self.num_item_mixture = item_mixture
-        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture )
-        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
-        self.user_mixture = MixtureEmbedding( user_mixture, n_users )
-        self.item_mixture = MixtureEmbedding( item_mixture, n_items )
-        self.kl_div = GMMKlDiv()
+#class KldivModel( nn.Module ):
+#    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent ):
+#        super().__init__()
+#        self.num_user_mixture  = user_mixture
+#        self.num_item_mixture = item_mixture
+#        self.user_gaussian = GaussianEmbedding( num_latent, user_mixture )
+#        self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
+#        self.user_mixture = MixtureEmbedding( user_mixture, n_users )
+#        self.item_mixture = MixtureEmbedding( item_mixture, n_items )
+#        self.kl_div = GMMKlDiv()
+#
+#    def kl_div_to_normal_gauss( self, gauss ):
+#        category_mu, category_sigma = torch.hsplit( gauss, 2 )
+#        num_latent = category_mu.shape[1]
+#
+#        return 0.5 * (
+#            torch.sum( torch.square( category_mu ), dim=-1 ) \
+#            + torch.sum( category_sigma, dim=-1 ) \
+#            - num_latent \
+#            - torch.log( torch.prod( category_sigma, dim=-1 ) )
+#        )
+#
+#    def forward( self, idx1, idx2, relation ):
+#       mixture_1, mixture_2 = None, None
+#
+#       if relation == 'user-user':
+#           mixture_1 =  self.user_mixture( idx1 )
+#           mixture_2 = self.user_mixture( idx2 )
+#           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+#
+#           return self.kl_div( mixture_1, mixture_2, user_gaussian, user_gaussian ), self.kl_div_to_normal_gauss( user_gaussian )
+#
+#       elif relation == 'user-item':
+#           mixture_1 = self.user_mixture( idx1 )
+#           mixture_2 = self.item_mixture( idx2 )
+#
+#           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+#           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
+#
+#           return self.kl_div( mixture_1, mixture_2, user_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( torch.vstack( ( user_gaussian, item_gaussian ) ) )
+#
+#       elif relation == 'item-item':
+#           mixture_1 = self.item_mixture( idx1 )
+#           mixture_2 = self.item_mixture( idx2 )
+#
+#           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
+#
+#           return self.kl_div( mixture_1, mixture_2, item_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( item_gaussian )
 
-    def kl_div_to_normal_gauss( self, gauss ):
-        category_mu, category_sigma = torch.hsplit( gauss, 2 )
-        num_latent = category_mu.shape[1]
+class DistanceKlDiv( nn.Module ):
+    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
+        super().__init__()
+        assert( attribute in [ 'item_attribute', 'user_attribute' ] )
+        self.n_mixture  = n_mixture
+        self.n_users = n_users
+        self.n_items = n_items
+        self.attribute = attribute
+
+        self.global_gaussian = GaussianEmbedding( n_latent, n_mixture )
+        self.user_gaussian = GaussianEmbedding( n_latent, n_users )
+        self.item_gaussian = GaussianEmbedding( n_latent, n_items )
+
+    def compute_kl_div( self, p : torch.Tensor, q : torch.Tensor):
+        mu_p, sigma_p = torch.hsplit( p, 2 )
+        mu_q, sigma_q = torch.hsplit( q, 2 )
+
+        num_latent  = mu_p.shape[1]
+
+        mu_p, sigma_p = mu_p.unsqueeze( dim=0 ), sigma_p.unsqueeze( dim=0 )
+        mu_q, sigma_q = mu_q.unsqueeze( dim=1 ), sigma_q.unsqueeze( dim=1 )
+
+
+        log_sigma = torch.log( 
+            torch.prod( sigma_q, dim=-1 ) \
+            / torch.prod( sigma_p, dim=-1 )
+        )
+        trace_sigma = torch.sum( ( 1 / sigma_q ) * sigma_p, dim=-1 )
+
+        sum_mu_sigma = torch.sum( torch.square( mu_p - mu_q ) * ( 1 / sigma_q ), dim=-1 )
+
+        return 0.5 * ( log_sigma + trace_sigma - num_latent + sum_mu_sigma ).T
+
+    def regularization( self ):
+        all_gauss = torch.vstack( ( self.user_gaussian( torch.arange( self.n_users ) ), self.item_gaussian( torch.arange( self.n_items ) ) ) )
+        gauss_mu, gauss_sigma = torch.hsplit( all_gauss, 2 )
+        num_latent = gauss_mu.shape[1]
 
         return 0.5 * (
-            torch.sum( torch.square( category_mu ), dim=-1 ) \
-            + torch.sum( category_sigma, dim=-1 ) \
-            - num_latent \
-            - torch.log( torch.prod( category_sigma, dim=-1 ) )
-        )
+           torch.sum( torch.square( gauss_mu ), dim=-1 ) \
+           + torch.sum( gauss_sigma, dim=-1 ) \
+           - num_latent \
+           - torch.log( torch.prod( gauss_sigma, dim=-1 ) )
+       )
 
-    def forward( self, idx1, idx2, relation ):
-       mixture_1, mixture_2 = None, None
+    def forward( self, user_idx, item_idx, is_test=False ):
+        unique_user, inverse_user = torch.unique( user_idx, return_inverse=True )
+        unique_item, inverse_item = torch.unique( item_idx, return_inverse=True )
 
-       if relation == 'user-user':
-           mixture_1 =  self.user_mixture( idx1 )
-           mixture_2 = self.user_mixture( idx2 )
-           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+        global_gauss = self.global_gaussian( torch.arange( self.n_mixture ) )
+        user_to_global = self.compute_kl_div( self.user_gaussian( unique_user ), global_gauss ) + self.compute_kl_div( global_gauss, self.user_gaussian( unique_user ) ).T
+        global_to_item = self.compute_kl_div( self.item_gaussian( unique_item ), global_gauss ).T + self.compute_kl_div( global_gauss, self.item_gaussian( unique_item ) )
 
-           return self.kl_div( mixture_1, mixture_2, user_gaussian, user_gaussian ), self.kl_div_to_normal_gauss( user_gaussian )
+        user_item_dist =  user_to_global.unsqueeze( dim=2 ) + global_to_item.unsqueeze( dim=0 )
 
-       elif relation == 'user-item':
-           mixture_1 = self.user_mixture( idx1 )
-           mixture_2 = self.item_mixture( idx2 )
+        if is_test:
+            return torch.min( user_item_dist, dim=1 )[0].reshape( -1, 1 )
 
-           user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
-           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
+        user_item_dist = user_item_dist[ inverse_user, :, inverse_item ]
 
-           return self.kl_div( mixture_1, mixture_2, user_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( torch.vstack( ( user_gaussian, item_gaussian ) ) )
+        if self.attribute == 'user_attribute':
+            return torch.min( user_item_dist, dim=-1 )[0].reshape( -1, 1 ), unique_user, user_to_global
 
-       elif relation == 'item-item':
-           mixture_1 = self.item_mixture( idx1 )
-           mixture_2 = self.item_mixture( idx2 )
-
-           item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
-
-           return self.kl_div( mixture_1, mixture_2, item_gaussian, item_gaussian ), self.kl_div_to_normal_gauss( item_gaussian )
+        elif self.attribute == 'item_attribute':
+            return torch.min( user_item_dist, dim=-1 )[0].reshape( -1, 1 ), unique_item, global_to_item.T
 
 if __name__ == '__main__':
    dataset = Dataset( 'item_genre' )
-   model = KldivModel( dataset.n_users, dataset.n_items, 4, 4, 32 )
-   for idx, batch in enumerate( DataLoader( dataset ) ):
-       print( batch )
+   model = DistanceKlDiv( dataset.n_users, dataset.n_items, 4, 32, 'item_attribute' )
+   for idx, batch in enumerate( DataLoader( dataset, batch_size=256, shuffle=True ) ):
        pos_interact, neg_interact = batch
-       res = model( pos_interact[:,0], pos_interact[:,1], 'user-item' )
+       res = model( pos_interact[:,0], pos_interact[:,1] )
        print( res )
        break
 

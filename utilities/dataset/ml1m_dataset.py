@@ -26,6 +26,9 @@ class Ml1mDataset( Dataset ):
     def get_test( self ):
         return self.test_mask > 0, self.adj_mat * self.test_mask
 
+    def get_reg_mat( self ):
+        return self.interact[ self.relation ].T / torch.sum( self.interact[ self.relation ], dim=0 ).reshape( -1, 1 )
+
     def compute_metapath_sim( self, commute ):
         diag = torch.diag( commute ).reshape( 1, -1 ) + torch.diag( commute ).reshape( -1, 1 )
         return 2 * commute / diag
@@ -65,6 +68,7 @@ class Ml1mDataset( Dataset ):
         self.train_mask = torch.load( os.path.join( self.dataset_dir, 'train_mask.pt' ) )
         self.val_mask = torch.load( os.path.join( self.dataset_dir, 'val_mask.pt' ) )
         self.test_mask = torch.load( os.path.join( self.dataset_dir, 'test_mask.pt' ) )
+
         self.interact = torch.load( os.path.join( self.dataset_dir, 'interact.pt' ) )
 
         self.train_adj_mat = self.adj_mat * self.train_mask
@@ -83,8 +87,5 @@ class Ml1mDataset( Dataset ):
 
 if __name__ == '__main__':
     dataset = Ml1mDataset( 'item_genre' )
+    print( dataset.get_reg_mat() )
     loader = DataLoader( dataset )
-    for i, batche in enumerate( loader ):
-        print( batche )
-        break
-
