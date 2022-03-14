@@ -7,7 +7,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_v4 import DistanceKlDiv as Model
+from models.model_v4 import KldivModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -37,10 +37,10 @@ class ModelTrainer( pl.LightningModule ):
         else:
             config['attribute'] = 'item_attribute'
 
-        self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_latent'], config['attribute']  )
+        self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
         # self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
-        self.category_loss = nn.CrossEntropyLoss( reduction='mean' )
+        self.category_loss = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -77,24 +77,29 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact = batch
+        pos_interact, context = batch
 
-        all_interact = torch.vstack( ( pos_interact, neg_interact ) )
-        uniquer_user, inverse_user = torch.unique( all_interact[:,0], return_inverse=True )
-        uniquer_item, inverse_item = torch.unique( all_interact[:,1], return_inverse=True )
+        pos_users, pos_items = torch.hsplit( pos_interact, 2 )
+        
+        unique_user, inverse_user = torch.unique( pos_users, return_inverse=True )
+        unique_item, inverse_item = torch.unique( torch.hstack( ( pos_items.flatten(), context.flatten() ) ), return_inverse=True )
 
-        dist, unique, category_dist = self.model( uniquer_user, uniquer_item )
+        dist, user_embed, item_embed = self.model( unique_user, unique_item, 'user-item' )
 
-        pos_dist = dist[ inverse_user, inverse_item ]
+        pos_dist = dist[ inverse_user, inverse_item[ : pos_items.shape[0] ] ]
+        context_dist = torch.gather( dist[ inverse_user ], 1,inverse_item[ pos_items.shape[0] : ].reshape( context.shape ) )
 
-        dist_loss = torch.mean( self.negative_log_likehood( self.config['beta'], pos_dist, dist ) )
+        dist_loss = torch.mean( self.negative_log_likehood( self.config['beta'], pos_dist, context_dist ) )
 
-        category_prob = self.gibb_sampling( self.config['beta'], category_dist )
-        category_loss = self.category_loss( category_prob, self.true_category[ unique ] )
+        category_loss = None
+        if self.config['attribute'] == 'item_attribute':
+            category_loss = self.category_loss( torch.log( item_embed ), self.true_category[ unique_item ] + 1e-6 )
+        elif self.config['attribute'] == 'user_attribute':
+            category_loss = self.category_loss( torch.log( user_embed ), self.true_category[ unique_user ] + 1e-6 )
 
         regularization = self.model.regularization()
 
-        loss =  dist_loss + category_loss + self.config['weight_decay'] * torch.sum( regularization )
+        loss =  dist_loss + self.config['gamma'] * category_loss + self.config['weight_decay'] * torch.sum( regularization )
 
         return loss
 
@@ -143,7 +148,7 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        limit_train_batches=256,
+        limit_train_batches=1,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {

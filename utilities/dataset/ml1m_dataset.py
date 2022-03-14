@@ -3,8 +3,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 class Ml1mDataset( Dataset ):
-    def __init__( self, relation ):
+    def __init__( self, relation, num_samples ):
         self.relation = relation
+        self.num_samples = num_samples
         self.dataset_dir = './process_datasets/ml-1m/'
 
         self.load_dataset()
@@ -12,13 +13,13 @@ class Ml1mDataset( Dataset ):
 
         self.n_users, self.n_items = self.adj_mat.shape
         self.user_sim, self.item_sim = self.compute_confidence_mat()
-        self.samples()
+        print( self.item_sim )
 
     def __len__( self ):
         return self.pos_interact.shape[0]
 
     def __getitem__( self, idx ):
-        return self.pos_interact[ idx ], self.neg_interact[ idx ]
+        return self.pos_interact[ idx ], torch.randint( self.n_items, ( self.num_samples, ) )
 
     def get_val( self ):
         return self.val_mask > 0, self.adj_mat * self.val_mask
@@ -62,6 +63,7 @@ class Ml1mDataset( Dataset ):
         self.val_mask = self.val_mask[ :, mask ]
         self.test_mask = self.test_mask[ :, mask ]
         self.interact[ 'item_genre' ] = self.interact['item_genre'][ :, mask ]
+        self.pos_interact = self.train_adj_mat.nonzero()
 
     def load_dataset( self ):
         self.adj_mat = torch.load( os.path.join( self.dataset_dir, 'adj_mat.pt' ) )
@@ -73,19 +75,14 @@ class Ml1mDataset( Dataset ):
 
         self.train_adj_mat = self.adj_mat * self.train_mask
 
-    def samples( self ):
-        num_interact = torch.sum( self.train_adj_mat, dim=-1 )
-        neg_interact = torch.zeros( ( 0, 2 ) )
-
-        for uid in range( self.n_users ):
-            item_ids = torch.multinomial( 1 - self.train_adj_mat[ uid ], num_samples=int( num_interact[ uid ].item() ) ).reshape( -1, 1 )
-            user_ids = torch.full( ( int( num_interact[uid].item() ), 1 ), uid )
-            neg_interact = torch.vstack( ( neg_interact, torch.hstack( ( user_ids, item_ids ) ) ) )
-
-        self.neg_interact = neg_interact.to( torch.long )
-        self.pos_interact = self.train_adj_mat.nonzero()
+    def samples( self, batch ):
+        return batch, torch.randint( self.n_items, ( 10, ) )
 
 if __name__ == '__main__':
-    dataset = Ml1mDataset( 'item_genre' )
+    dataset = Ml1mDataset( 'item_genre', 10 )
     print( dataset.get_reg_mat() )
-    loader = DataLoader( dataset )
+    loader = DataLoader( dataset, batch_size=256 )
+
+    for i, batch in enumerate( loader ):
+        pos_interact, context  = batch
+        break
