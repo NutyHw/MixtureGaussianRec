@@ -19,6 +19,8 @@ from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
+from ray.tune.suggest import ConcurrencyLimiter
+from ray.tune.suggest.bayesopt import BayesOptSearch
 
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
@@ -31,6 +33,7 @@ class ModelTrainer( pl.LightningModule ):
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
 
         self.true_category = self.dataset.get_reg_mat()
+        config['num_group'] = int( round( self.config['num_group'] ) )
 
         if self.true_category.shape[0] == self.n_users:
             config['attribute'] = 'user_attribute'
@@ -39,8 +42,7 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
-        self.cross_entropy_loss = nn.CrossEntropyLoss( reduction='sum' )
-        self.kl_div = nn.KLDivLoss( size_average='sum' )
+        self.kl_div = nn.KLDivLoss( size_average='batchmean' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -50,6 +52,9 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+
+    def cross_entropy_loss( self, predict_prob, true_prob ):
+        return - torch.sum( true_prob * torch.log( predict_prob ), dim=-1 )
 
     def gibb_sampling( self, beta, dist ):
         return torch.softmax( - beta * dist, dim=-1 )
@@ -77,10 +82,10 @@ class ModelTrainer( pl.LightningModule ):
         user, adj = batch
 
         dist, transition_prob, user_embed, item_embed = self.model( user )
-        embedding_prob = torch.softmax( - self.config['beta'] * dist, dim=-1 )
+        embedding_prob = self.gibb_sampling( self.config['beta'], dist )
 
-        embedding_loss = self.cross_entropy_loss( embedding_prob, adj )
-        transition_loss = self.cross_entropy_loss( transition_prob, adj )
+        embedding_loss = torch.mean( self.cross_entropy_loss( embedding_prob, adj ) )
+        transition_loss = torch.mean( self.cross_entropy_loss( transition_prob, adj ) )
         mutual_loss = self.kl_div( torch.log( transition_prob ), embedding_prob )
 
         category_loss = None
@@ -89,9 +94,12 @@ class ModelTrainer( pl.LightningModule ):
         elif self.config['attribute'] == 'user_attribute':
             category_loss = self.kl_div( torch.log( user_embed ), self.true_category[ user ] + 1e-6 )
 
+        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
+        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
+
         regularization = self.model.regularization()
 
-        loss =  self.config['alpha'] * embedding_loss + self.config['beta2'] * transition_loss + mutual_loss + self.config['weight_decay'] * ( torch.sum( regularization ) + category_loss )
+        loss =  alpha * embedding_loss + beta * transition_loss + mutual_loss + self.config['gamma'] * ( torch.mean( regularization ) + category_loss )
 
         return loss
 
@@ -99,8 +107,9 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
+        res = self.gibb_sampling( self.config['beta'], res )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -118,8 +127,9 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
+        res = self.gibb_sampling( self.config['beta'], res )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
@@ -140,8 +150,9 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=128,
+        max_epochs=1,
         num_sanity_val_steps=0,
+        limit_train_batches=1,
         callbacks=[
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
@@ -151,7 +162,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=5, mode="max", min_delta=1e-2)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -181,19 +192,22 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based( relation : str ):
     ray.init( num_cpus=12,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( relation, 100 ) )
+    dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 128,
-        'num_group' : tune.grid_search([ 8, 16, 32, 64 ]),
+        'batch_size' : 32,
+        'num_group' : tune.uniform( 4, 101 ),
 
         # hopefully will find right parameter
-        'alpha' : tune.uniform( 1, 20 ),
-        'beta' : tune.grid_search([ 1, 3, 5 ]),
-        'beta2' : tune.uniform( 1, 20 ),
-        'lr' : tune.grid_search([ 1e-3, 1e-2, 5e-2 ]),
-        'gamma' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
+        'alpha' : tune.uniform( 5, 50 ),
+        'min_alpha' : tune.uniform( 1e-2, 25 ),
+        'beta' : tune.uniform( 1, 50 ),
+        'beta2' : tune.uniform( 5, 50 ),
+        'min_beta2' : tune.uniform( 1e-2, 25 ),
+        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'lambda' : tune.uniform( 0.6, 1 ),
+        'gamma' : tune.uniform( 1e-5, 1e-1 ),
 
         # fix parameter
         'relation' : relation,
@@ -201,6 +215,9 @@ def tune_population_based( relation : str ):
         'recall_k' : 10,
         'ndcg_k' : 10
     }
+
+    algo = BayesOptSearch()
+    algo = ConcurrencyLimiter(algo, max_concurrent=12)
 
     scheduler = ASHAScheduler(
         grace_period=5,
@@ -216,6 +233,7 @@ def tune_population_based( relation : str ):
         num_samples=1,
         config=config,
         scheduler=scheduler,
+        search_alg=algo,
         name=f'ml1m_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
