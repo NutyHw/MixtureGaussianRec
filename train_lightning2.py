@@ -39,7 +39,8 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
-        self.category_loss = nn.KLDivLoss( size_average='sum' )
+        self.cross_entropy_loss = nn.CrossEntropyLoss( reduction='sum' )
+        self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -52,10 +53,6 @@ class ModelTrainer( pl.LightningModule ):
 
     def gibb_sampling( self, beta, dist ):
         return torch.softmax( - beta * dist, dim=-1 )
-
-    def negative_log_likehood( self, beta, pos_dist, context_dist ):
-        nll =  pos_dist + ( 1 / beta ) * torch.sum( torch.exp( - beta * context_dist ), dim=-1 ) 
-        return nll
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -77,29 +74,24 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, context = batch
+        user, adj = batch
 
-        pos_users, pos_items = torch.hsplit( pos_interact, 2 )
-        
-        unique_user, inverse_user = torch.unique( pos_users.flatten(), return_inverse=True )
-        unique_item, inverse_item = torch.unique( torch.hstack( ( pos_items.flatten(), context.flatten() ) ), return_inverse=True )
+        dist, transition_prob, user_embed, item_embed = self.model( user )
+        embedding_prob = torch.softmax( - self.config['beta'] * dist, dim=-1 )
 
-        dist, user_embed, item_embed = self.model( unique_user, unique_item, 'user-item' )
-
-        pos_dist = dist[ inverse_user, inverse_item[ : pos_items.shape[0] ] ]
-        context_dist = torch.gather( dist[ inverse_user ], 1,inverse_item[ pos_items.shape[0] : ].reshape( context.shape ) )
-
-        dist_loss = torch.sum( self.negative_log_likehood( self.config['beta'], pos_dist, context_dist ) )
+        embedding_loss = self.cross_entropy_loss( embedding_prob, adj )
+        transition_loss = self.cross_entropy_loss( transition_prob, adj )
+        mutual_loss = self.kl_div( torch.log( transition_prob ), embedding_prob )
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.category_loss( torch.log( item_embed ), self.true_category[ unique_item ] + 1e-6 )
+            category_loss = self.kl_div( torch.log( item_embed ), self.true_category + 1e-6 )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.category_loss( torch.log( user_embed ), self.true_category[ unique_user ] + 1e-6 )
+            category_loss = self.kl_div( torch.log( user_embed ), self.true_category[ user ] + 1e-6 )
 
         regularization = self.model.regularization()
 
-        loss =  dist_loss + self.config['gamma'] * category_loss + self.config['weight_decay'] * torch.sum( regularization )
+        loss =  self.config['alpha'] * embedding_loss + self.config['beta2'] * transition_loss + mutual_loss + self.config['weight_decay'] * ( torch.sum( regularization ) + category_loss )
 
         return loss
 
@@ -143,7 +135,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -193,14 +185,15 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'batch_size' : 128,
         'num_group' : tune.grid_search([ 8, 16, 32, 64 ]),
 
         # hopefully will find right parameter
-        'gamma' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
-        'weight_decay' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
+        'alpha' : tune.uniform( 1, 20 ),
         'beta' : tune.grid_search([ 1, 3, 5 ]),
+        'beta2' : tune.uniform( 1, 20 ),
         'lr' : tune.grid_search([ 1e-3, 1e-2, 5e-2 ]),
+        'gamma' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
 
         # fix parameter
         'relation' : relation,

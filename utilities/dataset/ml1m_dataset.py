@@ -3,9 +3,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 class Ml1mDataset( Dataset ):
-    def __init__( self, relation, num_samples ):
+    def __init__( self, relation ):
         self.relation = relation
-        self.num_samples = num_samples
         self.dataset_dir = './process_datasets/ml-1m/'
 
         self.load_dataset()
@@ -16,10 +15,10 @@ class Ml1mDataset( Dataset ):
         print( self.item_sim )
 
     def __len__( self ):
-        return self.pos_interact.shape[0]
+        return self.n_users
 
     def __getitem__( self, idx ):
-        return self.pos_interact[ idx ], torch.randint( self.n_items, ( self.num_samples, ) )
+        return idx, self.train_adj_mat[ idx ]
 
     def get_val( self ):
         return self.val_mask > 0, self.adj_mat * self.val_mask
@@ -63,7 +62,8 @@ class Ml1mDataset( Dataset ):
         self.val_mask = self.val_mask[ :, mask ]
         self.test_mask = self.test_mask[ :, mask ]
         self.interact[ 'item_genre' ] = self.interact['item_genre'][ :, mask ]
-        self.pos_interact = self.train_adj_mat.nonzero()
+
+        self.train_adj_mat = self.train_adj_mat / torch.sum( self.train_adj_mat, dim=-1 ).reshape( -1, 1 )
 
     def load_dataset( self ):
         self.adj_mat = torch.load( os.path.join( self.dataset_dir, 'adj_mat.pt' ) )

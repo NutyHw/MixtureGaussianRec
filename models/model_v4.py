@@ -133,7 +133,7 @@ class GMMKlDiv( nn.Module ):
         kl_div_mat = self.compute_kl_div( p, p )
         kl_div_mat2 = self.compute_kl_div( p, q )
 
-        return self.compute_mixture_kl_div( k1, k2, kl_div_mat, kl_div_mat2 )
+        return self.compute_mixture_kl_div( k1, k2, kl_div_mat, kl_div_mat2 ), kl_div_mat2
 
 #class GmmExpectedKernel( nn.Module ):
 #    def __init__( self ):
@@ -213,6 +213,7 @@ class KldivModel( nn.Module ):
         self.user_mixture = MixtureEmbedding( user_mixture, n_users )
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
         self.kl_div = GMMKlDiv()
+        self.transition_prob = nn.Linear( 1, 1, bias=True )
 
     def regularization( self ):
         user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
@@ -230,33 +231,25 @@ class KldivModel( nn.Module ):
             - torch.log( torch.prod( gaussian_sigma, dim=-1 ) )
         )
 
-    def forward( self, idx1, idx2, relation ):
-       mixture_1, mixture_2 = None, None
-       gaussian_1, gaussian_2 = None, None
+    def compute_transition_prob( self, mixture_1, mixture_2, kl_div_mat ):
+        temp = kl_div_mat.shape
 
-       if relation == 'user-user':
-           mixture_1 = self.user_mixture( idx1 )
-           mixture_2 = self.user_mixture( idx2 )
+        norm_kl_div_mat = kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
+        group_cat_prob = torch.sigmoid( self.transition_prob( norm_kl_div_mat ).reshape( temp ) )
 
-           gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
-           gaussian_2 = gaussian_1
+        return torch.linalg.multi_dot( ( mixture_1, group_cat_prob, mixture_2.T ) )
 
+    def forward( self, idx ):
+       mixture_1 = self.user_mixture( idx )
+       mixture_2 = self.item_mixture( torch.arange( self.n_items ) )
 
-       elif relation == 'user-item':
-           mixture_1 = self.user_mixture( idx1 )
-           mixture_2 = self.item_mixture( idx2 )
+       gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+       gaussian_2 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-           gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
-           gaussian_2 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
+       mixture_kl_div, kl_div_mat = self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 )
 
-       elif relation == 'item-item':
-           mixture_1 =  self.item_mixture( idx1 )
-           mixture_2 = self.item_mixture( idx2 )
+       return mixture_kl_div, self.compute_transition_prob( mixture_1, kl_div_mat, mixture_2 ), mixture_1, mixture_2
 
-           gaussian_1 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
-           gaussian_2 = gaussian_1
-
-       return self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 ), mixture_1, mixture_2
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
