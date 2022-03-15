@@ -73,6 +73,11 @@ class GaussianEmbedding( nn.Module ):
         super().__init__()
         self.mu = nn.Embedding( num_embeddings=n, embedding_dim=num_latent )
         self.sigma = nn.Embedding( num_embeddings=n, embedding_dim=num_latent )
+        self.init_xavior()
+
+    def init_xavior( self ):
+        nn.init.xavier_uniform( self.mu.weight )
+        nn.init.xavier_uniform( self.sigma.weight )
 
     def forward( self, idx : torch.LongTensor ):
         return torch.hstack( ( self.mu( idx ), F.elu( self.sigma( idx ) ) + 1 ) )
@@ -81,6 +86,10 @@ class MixtureEmbedding( nn.Module ):
     def __init__( self, num_mixture, n ):
         super().__init__()
         self.mixture = nn.Embedding( num_embeddings=n, embedding_dim=num_mixture )
+        self.init_xavior()
+
+    def init_xavior( self ):
+        nn.init.xavier_uniform( self.mixture.weight )
     
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )

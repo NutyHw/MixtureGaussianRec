@@ -34,28 +34,28 @@ class ModelTrainer( pl.LightningModule ):
 
         if self.true_category.shape[0] == self.n_users:
             config['attribute'] = 'user_attribute'
+            self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent']  )
         else:
             config['attribute'] = 'item_attribute'
+            self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
-        self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
-
-        # self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='sum' )
         self.category_loss = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def gibb_sampling( self, beta, dist ):
         return torch.softmax( - beta * dist, dim=-1 )
 
     def negative_log_likehood( self, beta, pos_dist, context_dist ):
-        return pos_dist +  ( 1 / beta ) * torch.sum( torch.exp( - beta * context_dist ), dim=-1 ) 
+        nll =  pos_dist + ( 1 / beta ) * torch.sum( torch.exp( - beta * context_dist ), dim=-1 ) 
+        return nll
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -81,7 +81,7 @@ class ModelTrainer( pl.LightningModule ):
 
         pos_users, pos_items = torch.hsplit( pos_interact, 2 )
         
-        unique_user, inverse_user = torch.unique( pos_users, return_inverse=True )
+        unique_user, inverse_user = torch.unique( pos_users.flatten(), return_inverse=True )
         unique_item, inverse_item = torch.unique( torch.hstack( ( pos_items.flatten(), context.flatten() ) ), return_inverse=True )
 
         dist, user_embed, item_embed = self.model( unique_user, unique_item, 'user-item' )
@@ -89,7 +89,7 @@ class ModelTrainer( pl.LightningModule ):
         pos_dist = dist[ inverse_user, inverse_item[ : pos_items.shape[0] ] ]
         context_dist = torch.gather( dist[ inverse_user ], 1,inverse_item[ pos_items.shape[0] : ].reshape( context.shape ) )
 
-        dist_loss = torch.mean( self.negative_log_likehood( self.config['beta'], pos_dist, context_dist ) )
+        dist_loss = torch.sum( self.negative_log_likehood( self.config['beta'], pos_dist, context_dist ) )
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
@@ -107,7 +107,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
         self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_validation_epoch_end( self ):
@@ -126,7 +126,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        res, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
         self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_test_epoch_end( self ):
@@ -143,12 +143,12 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        limit_train_batches=1,
+        max_epochs=128,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -159,7 +159,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg_score", patience=5, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -188,29 +188,29 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( relation ) )
+    ray.init( num_cpus=12,  _temp_dir='/data2/saito/ray_tmp/' )
+    dataset = ray.put( Dataset( relation, 100 ) )
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : tune.grid_search([ 256, 512, 1024 ]),
+        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'num_group' : tune.grid_search([ 8, 16, 32, 64 ]),
 
         # hopefully will find right parameter
-        'prediction_margin' : tune.grid_search([  1, 2, 4 ]) ,
-        'beta' : tune.grid_search([ 1, 2, 5 ]),
-        'weight_decay' : 1e-2,
-        'lr' : 1e-3,
+        'gamma' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
+        'weight_decay' : tune.grid_search([ 1e-5, 1e-3, 1e-1 ]),
+        'beta' : tune.grid_search([ 1, 3, 5 ]),
+        'lr' : tune.grid_search([ 1e-3, 1e-2, 5e-2 ]),
 
         # fix parameter
         'relation' : relation,
         'hr_k' : 1,
         'recall_k' : 10,
-        'ndcg_k' : 10,
-        'attribute' : 'item_attribute'
+        'ndcg_k' : 10
     }
 
     scheduler = ASHAScheduler(
-        grace_period=10,
+        grace_period=5,
         reduction_factor=2
     )
 
