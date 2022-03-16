@@ -42,7 +42,7 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
-        self.kl_div = nn.KLDivLoss( size_average='batchmean' )
+        self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -84,8 +84,8 @@ class ModelTrainer( pl.LightningModule ):
         dist, transition_prob, user_embed, item_embed = self.model( user )
         embedding_prob = self.gibb_sampling( self.config['beta'], dist )
 
-        embedding_loss = torch.mean( self.cross_entropy_loss( embedding_prob, adj ) )
-        transition_loss = torch.mean( self.cross_entropy_loss( transition_prob, adj ) )
+        embedding_loss = torch.sum( self.cross_entropy_loss( embedding_prob, adj ) )
+        transition_loss = torch.sum( self.cross_entropy_loss( transition_prob, adj ) )
         mutual_loss = self.kl_div( torch.log( transition_prob ), embedding_prob )
 
         category_loss = None
@@ -99,7 +99,7 @@ class ModelTrainer( pl.LightningModule ):
 
         regularization = self.model.regularization()
 
-        loss =  alpha * embedding_loss + beta * transition_loss + mutual_loss + self.config['gamma'] * ( torch.mean( regularization ) + category_loss )
+        loss =  alpha * embedding_loss + beta * transition_loss + mutual_loss + self.config['gamma'] * ( torch.sum( regularization ) + category_loss )
 
         return loss
 
@@ -107,7 +107,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
+        res, _, _, _ = self.model( batch[0][:,0]  )
         res = self.gibb_sampling( self.config['beta'], res )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
@@ -127,7 +127,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ), 'user-item' )
+        res, _, _, _ = self.model( batch[0][:,0] )
         res = self.gibb_sampling( self.config['beta'], res )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
@@ -150,9 +150,8 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1,
+        max_epochs=128,
         num_sanity_val_steps=0,
-        limit_train_batches=1,
         callbacks=[
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
@@ -230,7 +229,7 @@ def tune_population_based( relation : str ):
         metric='ndcg_score',
         mode='max',
         verbose=1,
-        num_samples=1,
+        num_samples=200,
         config=config,
         scheduler=scheduler,
         search_alg=algo,

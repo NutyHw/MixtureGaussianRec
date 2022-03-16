@@ -22,7 +22,7 @@ class YelpDataset( Dataset ):
         return self.n_users
 
     def __getitem__( self, idx ):
-        return idx, self.train_adj_mat[ idx ], None
+        return idx, self.train_adj_mat[ idx ]
 
     def get_val( self ):
         return self.val_mask, self.val_score
