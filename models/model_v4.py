@@ -76,11 +76,11 @@ class GaussianEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_uniform( self.mu.weight )
-        nn.init.xavier_uniform( self.sigma.weight )
+        nn.init.xavier_normal_( self.mu.weight )
+        nn.init.xavier_normal_( self.sigma.weight )
 
     def forward( self, idx : torch.LongTensor ):
-        return torch.hstack( ( self.mu( idx ), F.elu( self.sigma( idx ) ) + 1 ) )
+        return torch.hstack( ( self.mu( idx ), torch.exp( self.sigma( idx ) ) ) )
 
 class MixtureEmbedding( nn.Module ):
     def __init__( self, num_mixture, n ):
@@ -89,7 +89,7 @@ class MixtureEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_uniform( self.mixture.weight )
+        nn.init.xavier_normal_( self.mixture.weight )
     
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
@@ -235,9 +235,10 @@ class KldivModel( nn.Module ):
         temp = kl_div_mat.shape
 
         norm_kl_div_mat = kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
-        group_cat_prob = torch.sigmoid( self.transition_prob( norm_kl_div_mat ).reshape( temp ) )
+        group_cat_prob = torch.sigmoid( self.transition_prob( norm_kl_div_mat.reshape( -1, 1 ) ).reshape( temp ) )
 
-        return torch.linalg.multi_dot( ( mixture_1, group_cat_prob, mixture_2.T ) )
+        prob =  torch.linalg.multi_dot( ( mixture_1, group_cat_prob, mixture_2.T ) )
+        return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
     def forward( self, idx ):
        mixture_1 = self.user_mixture( idx )
@@ -248,7 +249,7 @@ class KldivModel( nn.Module ):
 
        mixture_kl_div, kl_div_mat = self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 )
 
-       return mixture_kl_div, self.compute_transition_prob( mixture_1, kl_div_mat, mixture_2 ), mixture_1, mixture_2
+       return mixture_kl_div, self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
 
 
 #class DistanceKlDiv( nn.Module ):
