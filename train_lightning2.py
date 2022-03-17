@@ -23,7 +23,7 @@ from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.bayesopt import BayesOptSearch
 
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
+from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
@@ -90,9 +90,9 @@ class ModelTrainer( pl.LightningModule ):
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.kl_div( torch.log( item_embed ), self.true_category + 1e-6 )
+            category_loss = self.kl_div( torch.log( item_embed ), self.true_category )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.kl_div( torch.log( user_embed ), self.true_category[ user ] + 1e-6 )
+            category_loss = self.kl_div( torch.log( user_embed ), self.true_category[ user ] )
 
         alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
         beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )

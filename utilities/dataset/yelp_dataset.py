@@ -1,3 +1,4 @@
+import os
 import random
 from collections import defaultdict
 import numpy as np
@@ -8,15 +9,24 @@ from torch.utils.data import Dataset
 random.seed(7)
 
 class YelpDataset( Dataset ):
-    def __init__( self ):
-        self.sample_size = 5
-        self.UB, self.BCat, self.BCity = self.load_dataset()
-        self.BCat, self.BCity = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity )
-        self.n_users, self.n_items = self.UB.shape[0], self.UB.shape[1]
+    def __init__( self, relation : str, is_preprocess=False ):
+        if not is_preprocess:
+            self.process_dir = './process_datasets/yelp/'
+            self.relation = relation
+            self.load_data()
 
-        self.pos_train_interact, pos_val_interact, pos_test_interact = self.train_test_val_split( self.UB )
-        self.filter_cold_start( self.pos_train_interact, pos_val_interact, pos_test_interact )
-        self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
+        else:
+            self.sample_size = 5
+            self.UB, self.UU, self.UCom, self.BCat, self.BCity = self.load_dataset()
+
+            self.BCat, self.BCity, self.UU, self.UCom = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity ), self.preprocess_relation( self.UU ), self.preprocess_relation( self.UCom )
+
+            self.n_users, self.n_items = self.UB.shape[0], self.UB.shape[1]
+
+            self.pos_train_interact, pos_val_interact, pos_test_interact = self.train_test_val_split( self.UB )
+            self.filter_cold_start( self.pos_train_interact, pos_val_interact, pos_test_interact )
+            self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
+            self.save_data()
 
     def __len__( self ):
         return self.n_users
@@ -30,6 +40,37 @@ class YelpDataset( Dataset ):
     def get_test( self ):
         return self.test_mask, self.test_score
 
+    def load_data( self ):
+        dataset = torch.load( os.path.join( self.process_dir, 'dataset.pt' ) )
+        train_adj_mat = dataset['train_adj_mat']
+
+        train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
+        self.train_adj_mat = train_adj_mat
+        self.val_mask = dataset['val_mask']
+        self.val_score = dataset['val_score']
+        self.test_mask = dataset['test_mask']
+        self.test_score = dataset['test_score']
+
+        metapath = torch.load( os.path.join( self.process_dir, 'metapath.pt' ) )
+        metapath = metapath[ self.relation ] + 1e-6
+        self.metapath = metapath / torch.sum( metapath, dim=-1 ).reshape( -1, 1 )
+
+    def save_data( self ):
+        torch.save( { 
+            'train_adj_mat' : self.train_adj_mat,
+            'val_mask' : self.val_mask,
+            'val_score' : self.val_score,
+            'test_mask' : self.test_mask,
+            'test_score' : self.test_score
+        }, 'dataset.pt' )
+
+        torch.save( {
+            'UU' : self.UU,
+            'UCom' : self.UCom,
+            'BCat' : self.BCat,
+            'BCity' : self.BCity
+        }, 'metapath.pt' )
+
     def preprocess_relation( self, relation  ):
         val, indices = relation.data, np.vstack((relation.row, relation.col))
         shape = relation.shape
@@ -38,17 +79,14 @@ class YelpDataset( Dataset ):
 
         return torch.sparse.FloatTensor(i, v, torch.Size(shape)).to_dense()
 
-    def get_reg_mat( self, relation : str ):
-        if relation == 'BCat':
-            return self.BCat
-        elif relation == 'BCity':
-            return self.BCity
+    def get_reg_mat( self ):
+        return self.metapath
 
     def load_dataset( self ):
         mat = scipy.io.loadmat( './process_datasets/yelp.mat' )
         UB, UU, UCom, BCat, BCity = (x.tocoo() for x in list(mat['relation'][0]))
 
-        return UB, BCat, BCity
+        return UB, UU, UCom, BCat, BCity
 
     def create_pytorch_interact( self, user_id, all_items ):
         user = torch.full( ( 1, len( all_items ) ), user_id, dtype=torch.long )
@@ -94,6 +132,11 @@ class YelpDataset( Dataset ):
         user_mask = torch.sum( train_adj_mat, dim=-1 ) > 0
         train_adj_mat = train_adj_mat[ user_mask ]
 
+        self.BCat = self.BCat[ item_mask ]
+        self.BCity = self.BCity[ item_mask ]
+        self.UU = self.UU[ user_mask ]
+        self.UCom = self.UCom[ user_mask ]
+
         self.train_adj_mat = train_adj_mat
 
         self.pos_train_interact = train_adj_mat.nonzero()
@@ -121,5 +164,5 @@ class YelpDataset( Dataset ):
         return val_mask > 0, val_scores, test_mask > 0, test_scores
 
 if __name__ == '__main__':
-    dataset = YelpDataset()
-    print( dataset[0] )
+    dataset = YelpDataset( 'BCity', is_preprocess=False )
+    batch = dataset[199]
