@@ -113,6 +113,28 @@ def create_dataset():
         for record in cursor:
             test_val_interact.append( [ intersect_users.index( record['user_id'] ), intersect_items.index( record['item_id'] ) ] )
 
+        all_rooms = list()
+        all_tags = list()
+
+        rooms_interact = list()
+        tags_interact = list()
+
+        cursor = db[ 'kratoos' ].find( { 'topic_id' : { '$in' : intersect_items } } )
+
+        for record in cursor:
+            for room in record['room']:
+                if room in all_rooms:
+                    rooms_interact.append( [ intersect_items.index( record['topic_id'] ), all_rooms.index( room ) ] )
+                else:
+                    rooms_interact.append( [ intersect_items.index( record['topic_id'] ), len( all_rooms ) ] )
+                    all_rooms.append( room )
+            for tag in record['tags']:
+                if tag in all_tags:
+                    tags_interact.append( [ intersect_items.index( record['topic_id'] ), all_tags.index( tag ) ] )
+                else:
+                    tags_interact.append( [ intersect_items.index( record['topic_id'] ), len( all_tags ) ] )
+                    all_tags.append( tag )
+
         dataset_dir = f'dataset_window_{i}'
         os.mkdir( dataset_dir )
 
@@ -121,15 +143,11 @@ def create_dataset():
         torch.save( torch.tensor( [ int(user) for user in intersect_users ] ), os.path.join( dataset_dir, 'all_users.pt' ) )
         torch.save( torch.tensor( intersect_items ), os.path.join( dataset_dir, 'all_items.pt' ) )
 
-def get_item_metadata( dataset_dir ):
-    db = connect()
-    for i in range( 6 ):
-        all_items_path = os.path.join( dataset_dir, f'dataset_window_{i}', 'all_items.pt' )
-        item_ids = torch.load( all_items_path ).tolist()
-        print( item_ids )
-        break
+        with open( os.path.join( dataset_dir, 'metadata_mapper.json' ), 'w' ) as f:
+            json.dump( { 'rooms' : all_rooms, 'tags' : all_tags }, f )
 
-        # cursor = db['kratoos'].find({ 'topic_id' : item_ids })
+        torch.save( torch.tensor( rooms_interact ), os.path.join( dataset_dir, 'item_rooms.pt' ) )
+        torch.save( torch.tensor( tags_interact ), os.path.join( dataset_dir, 'item_tags.pt' ) )
 
 if __name__ == '__main__':
-    filtered_no_tags_items()
+    create_dataset()
