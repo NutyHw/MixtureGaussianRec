@@ -50,6 +50,28 @@ def filter_items():
 
         db[f'clickstream_window_{i}'].delete_many({ 'item_id' : { '$in' : filtered_item } })
 
+def filtered_no_tags_items():
+    pipeline = [
+        { '$group' : { '_id' : '$item_id' } },
+        { '$lookup' : { 
+            'from' : 'kratoos',
+            'localField' : '_id',
+            'foreignField' : 'topic_id',
+            'as' : 'kratoo_data'
+        }},
+        { '$unwind' : '$kratoo_data' },
+        { '$match' :  { '$or' : [ { 'kratoo_data.tags.0' : { '$exists' : false } }, { 'kratoo_data.room.0' : { '$exists' : false } } ] } }
+    ]
+
+    for i in range( 7 ):
+        print(f'preprocess {i}')
+        cursor = db[f'clickstream_window_{i}'].aggregate( pipeline )
+        filtered_item = list()
+        for record in cursor:
+            filtered_item.append( record['_id'] )
+        filtered_item = list( set( filtered_item ) )
+        db[f'clickstream_window_{i}'].delete_many({ 'item_id' : { '$in' : filtered_item } })
+
 def create_dataset():
     db = connect()
 
@@ -99,5 +121,15 @@ def create_dataset():
         torch.save( torch.tensor( [ int(user) for user in intersect_users ] ), os.path.join( dataset_dir, 'all_users.pt' ) )
         torch.save( torch.tensor( intersect_items ), os.path.join( dataset_dir, 'all_items.pt' ) )
 
+def get_item_metadata( dataset_dir ):
+    db = connect()
+    for i in range( 6 ):
+        all_items_path = os.path.join( dataset_dir, f'dataset_window_{i}', 'all_items.pt' )
+        item_ids = torch.load( all_items_path ).tolist()
+        print( item_ids )
+        break
+
+        # cursor = db['kratoos'].find({ 'topic_id' : item_ids })
+
 if __name__ == '__main__':
-    create_dataset()
+    filtered_no_tags_items()
