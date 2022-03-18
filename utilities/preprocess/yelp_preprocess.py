@@ -1,4 +1,3 @@
-from collections import defaultdict
 import os
 import torch
 
@@ -14,24 +13,13 @@ def compute_jacard_sim( attribute_tensor : torch.Tensor ):
     m => number of attribute, n => number of point
     '''
 
-    all_jacard_sim = torch.zeros( ( attribute_tensor.shape[0], attribute_tensor.shape[0] ) )
-    non_zero_indices = attribute_tensor.nonzero()
+    jacard_sim = torch.zeros( ( attribute_tensor.shape[0], attribute_tensor.shape[0] ) )
+    for i in range( attribute_tensor.shape[0] ):
+        intersect = torch.sum( attribute_tensor[i].unsqueeze( dim=0 ) * attribute_tensor[ i + 1 : ], dim=-1 )
+        union = torch.sum( ( attribute_tensor[i].unsqueeze( dim=0 ) + attribute_tensor[ i + 1 : ] ) > 0, dim=-1 )
+        jacard_sim[ i, i + 1 : ] = intersect / union
 
-    temp = defaultdict( lambda : set() )
-    for i in range( non_zero_indices.shape[0] ):
-        temp[ non_zero_indices[i][0].item() ].add( non_zero_indices[i][1].item() )
-
-    for i in range( attribute_tensor.shape[0] - 1 ):
-        for j in range( i + 1, attribute_tensor.shape[0] ):
-            intersect = len( temp[i].intersection( temp[j] ) )
-            union = len( temp[i].union( temp[j] ) )
-            jacard_sim = 0
-            if union > 0:
-                jacard_sim = intersect / union
-            all_jacard_sim[ i, j ] = jacard_sim
-            all_jacard_sim[ j, i ] = jacard_sim
-
-    return all_jacard_sim
+    return jacard_sim
 
 if __name__ == '__main__':
     dataset, metapaths = load_file( '../../process_datasets/yelp/' )
@@ -39,7 +27,7 @@ if __name__ == '__main__':
     metapath_jacard_sim = dict()
 
     for metapath in metapaths.keys():
-        print(f'start {metapath}')
+        print( f'start metapath : { metapath }' )
         if metapath == 'UU':
             continue
         jacard_sim = compute_jacard_sim( metapaths[ metapath ] )

@@ -60,9 +60,10 @@ def filtered_no_tags_items():
             'as' : 'kratoo_data'
         }},
         { '$unwind' : '$kratoo_data' },
-        { '$match' :  { '$or' : [ { 'kratoo_data.tags.0' : { '$exists' : false } }, { 'kratoo_data.room.0' : { '$exists' : false } } ] } }
+        { '$match' :  { '$or' : [ { 'kratoo_data.tags.0' : { '$exists' : False } }, { 'kratoo_data.room.0' : { '$exists' : False } } ] } }
     ]
 
+    db = connect()
     for i in range( 7 ):
         print(f'preprocess {i}')
         cursor = db[f'clickstream_window_{i}'].aggregate( pipeline )
