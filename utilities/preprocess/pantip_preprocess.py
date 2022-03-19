@@ -33,23 +33,6 @@ def split_dataset():
         counter += 1
         start += relativedelta( months=1 )
 
-def filter_items():
-    pipeline = [
-        { '$group' : { '_id' : '$item_id', 'count' : { '$sum' : 1 } } },
-        { '$match' : { 'count' : { '$lt' : 10 } } }
-    ]
-
-    db = connect()
-    for i in range( 7 ):
-        print(f'preprocess {i}')
-        cursor = db[f'clickstream_window_{i}'].aggregate( pipeline )
-
-        filtered_item = list()
-        for record in cursor:
-            filtered_item.append( record['_id'] )
-
-        db[f'clickstream_window_{i}'].delete_many({ 'item_id' : { '$in' : filtered_item } })
-
 def filtered_no_tags_items():
     pipeline = [
         { '$group' : { '_id' : '$item_id' } },
@@ -151,4 +134,6 @@ def create_dataset():
         torch.save( torch.tensor( tags_interact ), os.path.join( dataset_dir, 'item_tags.pt' ) )
 
 if __name__ == '__main__':
+    split_dataset()
+    filtered_no_tags_items()
     create_dataset()
