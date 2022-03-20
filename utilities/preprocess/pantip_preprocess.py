@@ -29,9 +29,30 @@ def split_dataset():
             { '$match' : { 'timestamp' : { '$gte' : start, '$lt' : start + relativedelta( months=1 ) } } },
             { '$out' : f'clickstream_window_{counter}' }
         ]
-        db['dataset_daily_0.7_freq_1'].aggregate( pipeline )
+        db['filted_kratoos_less_than_10_interact'].aggregate( pipeline )
         counter += 1
         start += relativedelta( months=1 )
+
+def filter_non_active_items():
+    pipeline = [
+        { '$group' : { '_id' : '$item_id' , 'count' : { '$sum' : 1 } } },
+        { '$match' : { 'count' : { '$gte' : 10 } } }
+    ]
+
+    db = connect()
+    cursor = db['dataset_daily_0.7_freq_1'].aggregate( pipeline )
+    valid_items = list()
+
+    for record in cursor:
+        valid_items.append( record['_id'] )
+
+    pipeline = [
+        { '$match' : { 'item_id' : { '$in' : valid_items } } },
+        { '$out' : 'filted_kratoos_less_than_10_interact' }
+    ]
+
+    db['dataset_daily_0.7_freq_1'].aggregate( pipeline )
+
 
 def filtered_no_tags_items():
     pipeline = [
@@ -43,18 +64,22 @@ def filtered_no_tags_items():
             'as' : 'kratoo_data'
         }},
         { '$unwind' : '$kratoo_data' },
-        { '$match' :  { '$or' : [ { 'kratoo_data.tags.0' : { '$exists' : False } }, { 'kratoo_data.room.0' : { '$exists' : False } } ] } }
+        { '$match' :  { '$and' : [ { 'kratoo_data.tags.0' : { '$exists' : True } }, { 'kratoo_data.room.0' : { '$exists' : True } } ] } }
     ]
 
     db = connect()
-    for i in range( 7 ):
-        print(f'preprocess {i}')
-        cursor = db[f'clickstream_window_{i}'].aggregate( pipeline )
-        filtered_item = list()
-        for record in cursor:
-            filtered_item.append( record['_id'] )
-        filtered_item = list( set( filtered_item ) )
-        db[f'clickstream_window_{i}'].delete_many({ 'item_id' : { '$in' : filtered_item } })
+    cursor = db['filted_kratoos_less_than_10_interact'].aggregate( pipeline )
+    valid_items = list()
+    for record in cursor:
+        valid_items.append( record['_id'] )
+
+    pipeline = [
+        { '$match' : { 'item_id' : { '$in' : valid_items } } },
+        { '$out' : 'filted_kratoos_less_than_10_interact_and_no_tags_or_rooms' }
+    ]
+
+    db['filted_kratoos_less_than_10_interact'].aggregate( pipeline )
+
 
 def create_dataset():
     db = connect()
@@ -134,6 +159,11 @@ def create_dataset():
         torch.save( torch.tensor( tags_interact ), os.path.join( dataset_dir, 'item_tags.pt' ) )
 
 if __name__ == '__main__':
-    split_dataset()
+    print('start filter non active items')
+    filter_non_active_items()
+    print('start filter no tags or no rooms item')
     filtered_no_tags_items()
+    print('start split dataset')
+    split_dataset()
+    print('start create dataset')
     create_dataset()
