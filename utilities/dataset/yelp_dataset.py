@@ -4,6 +4,7 @@ from collections import defaultdict
 import numpy as np
 import scipy.io
 import torch
+import numpy as np
 from torch.utils.data import Dataset
 
 random.seed(7)
@@ -14,7 +15,8 @@ class YelpDataset( Dataset ):
             self.process_dir = './process_datasets/yelp/'
             self.relation = relation
             self.load_data()
-
+            self.samples()
+            # self.sampling()
         else:
             self.sample_size = 5
             self.UB, self.UU, self.UCom, self.BCat, self.BCity = self.load_dataset()
@@ -32,7 +34,7 @@ class YelpDataset( Dataset ):
         return self.n_users
 
     def __getitem__( self, idx ):
-        return idx, self.train_adj_mat[ idx ]
+        return self.pos_interact[ idx ], self.neg_interact[ idx ]
 
     def get_val( self ):
         return self.val_mask, self.val_score
@@ -44,7 +46,7 @@ class YelpDataset( Dataset ):
         dataset = torch.load( os.path.join( self.process_dir, 'dataset.pt' ) )
         train_adj_mat = dataset['train_adj_mat']
 
-        train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
+        # train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
         self.train_adj_mat = train_adj_mat
         self.val_mask = dataset['val_mask']
         self.val_score = dataset['val_score']
@@ -54,6 +56,7 @@ class YelpDataset( Dataset ):
         metapath = torch.load( os.path.join( self.process_dir, 'metapath.pt' ) )
         metapath = metapath[ self.relation ] + 1e-6
         self.metapath = metapath / torch.sum( metapath, dim=-1 ).reshape( -1, 1 )
+        self.n_users, self.n_items = self.train_adj_mat.shape
 
     def save_data( self ):
         torch.save( { 
@@ -129,7 +132,7 @@ class YelpDataset( Dataset ):
 
         item_mask = torch.sum( train_adj_mat, dim=0 ) > 0
         train_adj_mat = train_adj_mat[ :, item_mask ]
-        user_mask = torch.sum( train_adj_mat, dim=-1 ) > 0
+        user_mask = torch.sum( train_adj_mat, dim=1 ) > 0
         train_adj_mat = train_adj_mat[ user_mask ]
 
         self.BCat = self.BCat[ item_mask ]
@@ -163,6 +166,21 @@ class YelpDataset( Dataset ):
 
         return val_mask > 0, val_scores, test_mask > 0, test_scores
 
+    def samples( self ):
+        user_count = torch.sum( self.train_adj_mat, dim=-1 ).to( torch.int ).tolist()
+        neg_adj = 1 - self.train_adj_mat
+        neg_adj = neg_adj / torch.sum( neg_adj, dim=-1 ).reshape( -1, 1 )
+
+        neg_interact = torch.zeros( ( 0, 2 ), dtype=torch.long )
+        for idx, size in enumerate( user_count ):
+            chosen_items = torch.tensor( np.random.choice( self.n_items, size * 2, p=neg_adj[idx].numpy() ) )
+            users = torch.full( chosen_items.shape, idx )
+            interact = torch.vstack( ( users, chosen_items ) ).T
+            neg_interact = torch.vstack( ( neg_interact, interact ) )
+
+        self.pos_interact = self.train_adj_mat.nonzero().tile( 1, 2 ).reshape( -1, 2 )
+        self.neg_interact = neg_interact
+
+
 if __name__ == '__main__':
-    dataset = YelpDataset( 'BCity', is_preprocess=False )
-    batch = dataset[199]
+    dataset = YelpDataset( 'UCom', is_preprocess=False )

@@ -240,16 +240,17 @@ class KldivModel( nn.Module ):
         prob =  torch.linalg.multi_dot( ( mixture_1, group_cat_prob, mixture_2.T ) )
         return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
-    def forward( self, idx ):
-       mixture_1 = self.user_mixture( idx )
-       mixture_2 = self.item_mixture( torch.arange( self.n_items ) )
+    def forward( self, user_idx, item_idx ):
+        mixture_1 = self.user_mixture( user_idx )
+        mixture_2 = self.item_mixture( item_idx )
 
-       gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
-       gaussian_2 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-       mixture_kl_div, kl_div_mat = self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 )
+        gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
+        gaussian_2 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-       return mixture_kl_div, self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
+        mixture_kl_div, kl_div_mat = self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 )
+
+        return mixture_kl_div, self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
 
 
 #class DistanceKlDiv( nn.Module ):
@@ -315,6 +316,5 @@ class KldivModel( nn.Module ):
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = KldivModel( 600, 4000, 4, 4, 32 )
-   print( model( torch.tensor([ 0 ]).to( torch.long ), torch.tensor( [ 2, 3, 5,  6 ] ).to( torch.long ), 'item-item' ) )
-   
+   print( model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 4000 ) ) )
 

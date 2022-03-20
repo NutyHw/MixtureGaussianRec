@@ -42,6 +42,8 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
+        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
         self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
@@ -53,11 +55,8 @@ class ModelTrainer( pl.LightningModule ):
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
-    def cross_entropy_loss( self, predict_prob, true_prob ):
-        return - torch.sum( true_prob * torch.log( predict_prob ), dim=-1 )
-
-    def gibb_sampling( self, beta, dist ):
-        return torch.softmax( - beta * dist, dim=-1 )
+    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
+        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -79,27 +78,33 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        user, adj = batch
+        pos_interact, neg_interact = batch
+        batch_size = pos_interact.shape[0]
 
-        dist, transition_prob, user_embed, item_embed = self.model( user )
-        embedding_prob = self.gibb_sampling( self.config['beta'], dist )
+        input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
+        unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
+        unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
 
-        embedding_loss = torch.sum( self.cross_entropy_loss( embedding_prob, adj ) )
-        transition_loss = torch.sum( self.cross_entropy_loss( transition_prob, adj ) )
-        mutual_loss = self.kl_div( torch.log( transition_prob ), embedding_prob )
+        mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
+        pos_mixture, neg_mixture = torch.hsplit( mixture[ inverse_user, inverse_item ], 2 )
+        pos_transition, neg_transition = torch.hsplit( transition[ inverse_user, inverse_item ], 2 )
+
+        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ) )
+        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ) )
+        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.kl_div( torch.log( item_embed ), self.true_category )
+            category_loss = self.kl_div( torch.log( item_mixture ), self.true_category[ unique_item ] )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.kl_div( torch.log( user_embed ), self.true_category[ user ] )
+            category_loss = self.kl_div( torch.log( user_mixture ), self.true_category[ unique_user ] )
 
         alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
         beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
 
         regularization = self.model.regularization()
 
-        loss =  alpha * embedding_loss + beta * transition_loss + mutual_loss + self.config['gamma'] * ( torch.sum( regularization ) + category_loss )
+        loss =  alpha * l1_loss + beta * l2_loss + l3_loss + self.config['gamma'] * ( torch.sum( regularization ) + category_loss )
 
         return loss
 
@@ -107,9 +112,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0]  )
-        res = self.gibb_sampling( self.config['beta'], res )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -127,9 +131,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0] )
-        res = self.gibb_sampling( self.config['beta'], res )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
