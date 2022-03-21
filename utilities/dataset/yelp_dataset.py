@@ -173,7 +173,7 @@ class YelpDataset( Dataset ):
 
         neg_interact = torch.zeros( ( 0, 2 ), dtype=torch.long )
         for idx, size in enumerate( user_count ):
-            chosen_items = torch.tensor( np.random.choice( self.n_items, size * 2, p=neg_adj[idx].numpy() ) )
+            chosen_items = torch.tensor( np.random.choice( self.n_items, size, p=neg_adj[idx].numpy() ) )
             users = torch.full( chosen_items.shape, idx )
             interact = torch.vstack( ( users, chosen_items ) ).T
             neg_interact = torch.vstack( ( neg_interact, interact ) )

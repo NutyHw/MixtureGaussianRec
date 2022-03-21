@@ -7,7 +7,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_v4 import KldivModel as Model
+from models.model_v4 import ExpectedKernelModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -86,6 +86,7 @@ class ModelTrainer( pl.LightningModule ):
         unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
 
         mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
+        print( mixture.shape, transition.shape, user_mixture.shape, item_mixture.shape )
         pos_mixture, neg_mixture = torch.hsplit( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.hsplit( transition[ inverse_user, inverse_item ], 2 )
 
@@ -95,16 +96,21 @@ class ModelTrainer( pl.LightningModule ):
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.kl_div( torch.log( item_mixture ), self.true_category[ unique_item ] )
+            category_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ), item_mixture )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.kl_div( torch.log( user_mixture ), self.true_category[ unique_user ] )
+            category_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ), user_mixture )
 
-        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
-        beta = max( self.config['beta'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta'] )
+        user_distance, item_distance = self.model.mutual_distance()
 
-        regularization = self.model.regularization()
+        user_clustering = self.model.clustering_assignment_hardening( user_mixture )
+        item_clustering = self.model.clustering_assignment_hardening( item_mixture )
 
-        loss =  alpha * l1_loss + beta * l2_loss + l3_loss + self.config['gamma'] * ( torch.sum( regularization ) + category_loss )
+        prediction_loss = l1_loss + l2_loss + l3_loss
+        clustering_loss = user_clustering + item_clustering
+        regularization_loss = user_distance + item_distance
+
+        loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
+        print(loss)
 
         return loss
 
@@ -112,7 +118,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
@@ -131,7 +137,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
         self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_test_epoch_end( self ):
@@ -139,7 +145,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_yelp2_{self.config["relation"]}_double_neg_model.pt' )
+        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -153,7 +159,8 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=128,
+        max_epochs=1,
+        limit_train_batches=1,
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
@@ -204,15 +211,10 @@ def tune_population_based( relation : str ):
 
         # hopefully will find right parameter
         'prediction_margin' : tune.uniform( 1, 5 ),
-        'transition_margin' : tune.uniform( 0.1, 0.5 ),
-        'num_group' : tune.uniform(4,51),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
-        'lr' : tune.loguniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 5, 50 ),
-        'min_alpha' : tune.uniform( 1e-2, 25 ),
-        'beta' : tune.uniform( 5, 50 ),
-        'min_beta' : tune.uniform( 1e-2, 25 ),
-        'lambda' : tune.uniform( 0.6, 1 ),
+        'transition_margin' : tune.uniform( 0.05, 0.5 ),
+        'beta' : tune.uniform( 1e-6, 1 ),
+        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'gamma' : tune.uniform( 1e-6, 1 ),
 
         # fix parameter
         'relation' : relation,
@@ -225,7 +227,7 @@ def tune_population_based( relation : str ):
     algo = ConcurrencyLimiter(algo, max_concurrent=12)
 
     scheduler = ASHAScheduler(
-        grace_period=5,
+        grace_period=1,
         reduction_factor=2
     )
 
@@ -235,11 +237,11 @@ def tune_population_based( relation : str ):
         metric='ndcg_score',
         mode='max',
         verbose=1,
-        num_samples=100,
+        num_samples=1,
         config=config,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'double_neg_yelp_dataset_{relation}',
+        name=f'non_colapse_yelp_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
