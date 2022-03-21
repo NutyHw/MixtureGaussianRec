@@ -135,33 +135,33 @@ class GMMKlDiv( nn.Module ):
 
         return self.compute_mixture_kl_div( k1, k2, kl_div_mat, kl_div_mat2 ), kl_div_mat2
 
-#class GmmExpectedKernel( nn.Module ):
-#    def __init__( self ):
-#        super().__init__()
-#
-#    def compute_gaussian_expected_likehood( self, p : torch.Tensor, q : torch.Tensor ):
-#        mu_p, sigma_p = torch.hsplit( p, 2 )
-#        mu_q, sigma_q = torch.hsplit( q, 2 )
-#
-#        num_latent = mu_p.shape[1]
-#
-#        sigma_p, sigma_q = sigma_p.unsqueeze( dim=2 ), sigma_q.T.unsqueeze( dim=0 )
-#        mu_p, mu_q = mu_p.unsqueeze( dim=2 ), mu_q.T.unsqueeze( dim=0 )
-#
-#        return torch.exp(
-#            0.5 * ( -\
-#                torch.log( torch.prod( sigma_p + sigma_q, dim=1 ) ) -\
-#                num_latent * torch.log( torch.tensor( [ 2 * math.pi ] ) ) -\
-#                torch.sum( ( mu_p - mu_q ) ** 2 * ( 1 / ( sigma_p + sigma_q ) ), dim=1 )
-#            )
-#        )
-#
-#    def compute_mixture_gaussian_expected_likehood( self, k1, k2, gaussian_mat ):
-#        return torch.log( torch.linalg.multi_dot( ( k1, gaussian_mat, k2.T ) ) )
-#
-#    def forward( self, k1, k2, p, q ):
-#        gaussian_mat = self.compute_gaussian_expected_likehood( p, q )
-#        return self.compute_mixture_gaussian_expected_likehood( k1, k2, gaussian_mat )
+class GmmExpectedKernel( nn.Module ):
+    def __init__( self ):
+        super().__init__()
+
+    def compute_gaussian_expected_likehood( self, p : torch.Tensor, q : torch.Tensor ):
+        mu_p, sigma_p = torch.hsplit( p, 2 )
+        mu_q, sigma_q = torch.hsplit( q, 2 )
+
+        num_latent = mu_p.shape[1]
+
+        sigma_p, sigma_q = sigma_p.unsqueeze( dim=2 ), sigma_q.T.unsqueeze( dim=0 )
+        mu_p, mu_q = mu_p.unsqueeze( dim=2 ), mu_q.T.unsqueeze( dim=0 )
+
+        return torch.exp(
+            0.5 * ( -\
+                torch.log( torch.prod( sigma_p + sigma_q, dim=1 ) ) -\
+                num_latent * torch.log( torch.tensor( [ 2 * math.pi ] ) ) -\
+                torch.sum( ( mu_p - mu_q ) ** 2 * ( 1 / ( sigma_p + sigma_q ) ), dim=1 )
+            )
+        )
+
+    def compute_mixture_gaussian_expected_likehood( self, k1, k2, gaussian_mat ):
+        return torch.log( torch.linalg.multi_dot( ( k1, gaussian_mat, k2.T ) ) )
+
+    def forward( self, k1, k2, p, q ):
+        gaussian_mat = self.compute_gaussian_expected_likehood( p, q )
+        return self.compute_mixture_gaussian_expected_likehood( k1, k2, gaussian_mat ), gaussian_mat
 
 #class ExpectedKernelModel( nn.Module ):
 #    def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent, mean_constraint, sigma_min, sigma_max ):
@@ -201,57 +201,70 @@ class GMMKlDiv( nn.Module ):
 #
 #            return self.expected_likehood_kernel( mixture_1, mixture_2, item_gaussian, item_gaussian )
 
-class KldivModel( nn.Module ):
+class ExpectedKernelModel( nn.Module ):
     def __init__( self, n_users, n_items, user_mixture, item_mixture, num_latent ):
         super().__init__()
         self.n_users = n_users
         self.n_items = n_items
+        self.num_latent = num_latent
         self.num_user_mixture  = user_mixture
         self.num_item_mixture = item_mixture
         self.user_gaussian = GaussianEmbedding( num_latent, user_mixture )
         self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
         self.user_mixture = MixtureEmbedding( user_mixture, n_users )
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
-        self.kl_div = GMMKlDiv()
-        self.transition_prob = nn.Linear( 1, 1, bias=True )
+        self.expected_kernel = GmmExpectedKernel()
 
-    def regularization( self ):
+    def mutual_distance( self ):
         user_gaussian = self.user_gaussian( torch.arange( self.num_user_mixture ) )
         item_gaussian = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-        gaussian = torch.vstack( ( user_gaussian, item_gaussian ) )
-        gaussian_mu, gaussian_sigma = torch.hsplit( gaussian, 2 )
+        user_mu = user_gaussian[ :, : self.num_latent ]
+        item_mu = item_gaussian[ :, : self.num_latent ]
 
-        num_latent = gaussian_mu.shape[1]
+        user_distance = torch.sum( F.pdist( user_mu[ :, None ], user_mu ) )
+        item_distance = torch.sum( F.pdist( item_mu[ :, None ], item_mu ) )
 
-        return 0.5 * (
-            torch.sum( torch.square( gaussian_mu ), dim=-1 ) \
-            + torch.sum( gaussian_sigma, dim=-1 ) \
-            - num_latent \
-            - torch.log( torch.prod( gaussian_sigma, dim=-1 ) )
-        )
+        return user_distance / self.num_user_mixture ** 2, item_distance / self.num_user_mixture ** 2
 
-    def compute_transition_prob( self, mixture_1, mixture_2, kl_div_mat ):
-        temp = kl_div_mat.shape
+    def normalize( self, mat ):
+        return mat / torch.sum( mat, dim=-1 ).reshape( -1, 1 )
 
-        norm_kl_div_mat = kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
-        group_cat_prob = torch.sigmoid( self.transition_prob( norm_kl_div_mat.reshape( -1, 1 ) ).reshape( temp ) )
+    def compute_group_prob( self, mixture_1, mixture_2, gaussian_1, gaussian_2 ):
+        user_group_mixture, _ = self.expected_kernel( mixture_1, F.one_hot( torch.arange( self.num_user_mixture ) ).to( torch.float ), gaussian_1, gaussian_1 )
+        item_group_mixture, _ = self.expected_kernel( mixture_2, F.one_hot( torch.arange( self.num_item_mixture ) ).to( torch.float ), gaussian_2, gaussian_2 )
 
-        prob =  torch.linalg.multi_dot( ( mixture_1, group_cat_prob, mixture_2.T ) )
-        return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
+        user_group_prob = self.normalize( torch.exp( user_group_mixture ) )
+        item_group_prob = self.normalize( torch.exp( item_group_mixture ) )
 
-    def forward( self, user_idx, item_idx ):
+        return user_group_prob, item_group_prob
+
+    def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
+        transition_prob = self.normalize( kl_div_mat )
+
+        return torch.linalg.multi_dot( ( user_group_prob, transition_prob, item_group_prob.T ) ), user_group_prob, item_group_prob
+
+    def clustering_assignment_hardening( self, group_prob ):
+        square_group_prob = group_prob ** 2
+        Q = ( square_group_prob / torch.sum( square_group_prob, dim=0 ).reshape( 1, -1 ) ) /\
+            torch.sum( square_group_prob / torch.sum( square_group_prob, dim=0 ).reshape( 1, -1 ), dim=-1 ).reshape( -1, 1 )
+
+        return F.kl_div( torch.log( Q ), group_prob, reduction='sum' )
+
+    def forward( self, user_idx, item_idx, is_test=False ):
         mixture_1 = self.user_mixture( user_idx )
         mixture_2 = self.item_mixture( item_idx )
-
 
         gaussian_1 = self.user_gaussian( torch.arange( self.num_user_mixture ) )
         gaussian_2 = self.item_gaussian( torch.arange( self.num_item_mixture ) )
 
-        mixture_kl_div, kl_div_mat = self.kl_div( mixture_1, mixture_2, gaussian_1, gaussian_2 )
+        mixture_kl_div, kl_div_mat = self.expected_kernel( mixture_1, mixture_2, gaussian_1, gaussian_2 )
 
-        return mixture_kl_div, self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
-
+        if is_test:
+            return mixture_kl_div
+        else:
+            user_group_prob, item_group_prob = self.compute_group_prob( mixture_1, mixture_2, gaussian_1, gaussian_2 )
+            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), user_group_prob, item_group_prob
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
@@ -315,6 +328,6 @@ class KldivModel( nn.Module ):
 
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
-   model = KldivModel( 600, 4000, 4, 4, 32 )
-   print( model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 4000 ) ) )
+   model = ExpectedKernelModel( 600, 4000, 4, 4, 32 )
+   print( model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) )
 

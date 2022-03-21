@@ -7,7 +7,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_v4 import KldivModel as Model
+from models.model_v4 import ExpectedKernelModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -95,16 +95,20 @@ class ModelTrainer( pl.LightningModule ):
 
         category_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.kl_div( torch.log( item_mixture ), self.true_category[ unique_item ] )
+            category_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ), item_mixture )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.kl_div( torch.log( user_mixture ), self.true_category[ unique_user ] )
+            category_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ), user_mixture )
 
-        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
-        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
+        user_distance, item_distance = self.model.mutual_distance()
 
-        regularization = self.model.regularization()
+        user_clustering = self.model.clustering_assignment_hardening( user_mixture )
+        item_clustering = self.model.clustering_assignment_hardening( item_mixture )
 
-        loss =  alpha * l1_loss + beta * l2_loss + l3_loss + self.config['gamma'] * ( torch.sum( regularization ) + category_loss )
+        prediction_loss = l1_loss + l2_loss + l3_loss
+        clustering_loss = user_clustering + item_clustering
+        regularization_loss = user_distance + item_distance
+
+        loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
 
         return loss
 
@@ -112,8 +116,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -131,8 +135,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
@@ -202,14 +206,9 @@ def tune_population_based( relation : str ):
         'num_group' : tune.uniform( 4, 101 ),
 
         # hopefully will find right parameter
-        'alpha' : tune.uniform( 5, 50 ),
-        'min_alpha' : tune.uniform( 1e-2, 25 ),
-        'beta' : tune.uniform( 1, 50 ),
-        'beta2' : tune.uniform( 5, 50 ),
-        'min_beta2' : tune.uniform( 1e-2, 25 ),
+        'beta' : tune.uniform( 1e-6, 1 ),
         'lr' : tune.uniform( 1e-4, 1e-1 ),
-        'lambda' : tune.uniform( 0.6, 1 ),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'gamma' : tune.uniform( 1e-6, 1 ),
 
         # fix parameter
         'relation' : relation,
