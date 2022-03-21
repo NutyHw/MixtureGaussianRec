@@ -100,7 +100,7 @@ class ModelTrainer( pl.LightningModule ):
             category_loss = self.kl_div( torch.log( user_mixture ), self.true_category[ unique_user ] )
 
         alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
-        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
+        beta = max( self.config['beta'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta'] )
 
         regularization = self.model.regularization()
 
@@ -113,7 +113,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def validation_step( self, batch, batch_idx ):
         res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -132,14 +132,14 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_step( self, batch, batch_idx ):
         res, _, _, _ = self.model( batch[0][:,0], torch.arange( self.n_items ) )
-        self.y_pred = torch.vstack( ( self.y_pred, - res ) )
+        self.y_pred = torch.vstack( ( self.y_pred, res ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_ml1m_{self.config["relation"]}_model.pt' )
+        torch.save( self.y_pred, f'test_yelp2_{self.config["relation"]}_double_neg_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -156,6 +156,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
         max_epochs=128,
         num_sanity_val_steps=0,
         callbacks=[
+            Scheduler(),
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
                 'recall_score' : 'recall_score',
@@ -164,7 +165,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
         ],
         progress_bar_refresh_rate=0
     )
@@ -193,29 +194,31 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=12,  _temp_dir='/data2/saito/ray_tmp/' )
+    ray.init( num_cpus=10,  _temp_dir='/data2/saito/ray_tmp/' )
     dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 32,
+        'batch_size' : 128,
         'num_group' : tune.uniform( 4, 101 ),
 
         # hopefully will find right parameter
+        'prediction_margin' : tune.uniform( 1, 5 ),
+        'transition_margin' : tune.uniform( 0.1, 0.5 ),
+        'num_group' : tune.uniform(4,51),
+        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'lr' : tune.loguniform( 1e-4, 1e-1 ),
         'alpha' : tune.uniform( 5, 50 ),
         'min_alpha' : tune.uniform( 1e-2, 25 ),
-        'beta' : tune.uniform( 1, 50 ),
-        'beta2' : tune.uniform( 5, 50 ),
-        'min_beta2' : tune.uniform( 1e-2, 25 ),
-        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'beta' : tune.uniform( 5, 50 ),
+        'min_beta' : tune.uniform( 1e-2, 25 ),
         'lambda' : tune.uniform( 0.6, 1 ),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
 
         # fix parameter
         'relation' : relation,
-        'hr_k' : 1,
-        'recall_k' : 10,
-        'ndcg_k' : 10
+        'hr_k' : 20,
+        'recall_k' : 20,
+        'ndcg_k' : 100
     }
 
     algo = BayesOptSearch()
@@ -232,11 +235,11 @@ def tune_population_based( relation : str ):
         metric='ndcg_score',
         mode='max',
         verbose=1,
-        num_samples=200,
+        num_samples=100,
         config=config,
         scheduler=scheduler,
         search_alg=algo,
-        name=f'ml1m_dataset_{relation}',
+        name=f'double_neg_yelp_dataset_{relation}',
         keep_checkpoints_num=2,
         local_dir=f"/data2/saito/",
         checkpoint_score_attr='ndcg_score',
