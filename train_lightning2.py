@@ -154,7 +154,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -206,7 +206,7 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 128,
+        'batch_size' : 32,
         'num_group' : tune.uniform( 4, 101 ),
 
         # hopefully will find right parameter
