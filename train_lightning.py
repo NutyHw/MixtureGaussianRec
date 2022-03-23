@@ -1,12 +1,12 @@
+import sys
 import os
 import json 
-import random
+import numpy as np
 from functools import partial
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models.model import Model
+from models.model import ExpectedKernelModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -15,14 +15,15 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 import ray
 from ray import tune
-from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.bayesopt import BayesOptSearch
-from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.pantip_dataset import PantipDataset as Dataset
+from utilities.dataset.yelp_dataset import YelpDataset as Dataset
+
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
@@ -30,34 +31,32 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
-        self.reg_mat = self.dataset.get_reg_mat( config['relation'] )
 
-        config['num_user'] = self.n_users
-        config['num_item'] = self.n_items
-        config['num_category'] = self.reg_mat.shape[1]
-        config['num_group'] = int( round( config['num_group'] ) )
+        self.true_category = self.dataset.get_reg_mat()
+        config['num_group'] = int( round( self.config['num_group'] ) )
 
-        self.model = Model( **config )
+        if self.true_category.shape[0] == self.n_users:
+            config['attribute'] = 'user_attribute'
+            self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent']  )
+        else:
+            config['attribute'] = 'item_attribute'
+            self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
         self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
         self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
-        self.kl_div_loss = nn.KLDivLoss()
-
-        self.alpha = config['alpha']
-        self.beta = config['beta']
-        self.gamma = config['gamma']
+        self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
-        return self.dataset.train_dataloader()
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=16 )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
+        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -83,23 +82,29 @@ class ModelTrainer( pl.LightningModule ):
         batch_size = pos_interact.shape[0]
 
         input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
-        res = self.model( input_idx[:,0], input_idx[:,1] )
+        unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
+        unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
 
-        pos_res_out, neg_res_out = torch.split( res['out'], split_size_or_sections=batch_size, dim=0 )
-        pos_res_kg_prob, neg_res_kg_prob = torch.split( res['kg_prob'], split_size_or_sections=batch_size, dim=0 )
+        mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
+        pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
+        pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        # prediction loss
-        l1_loss = self.prediction_loss( pos_res_out, neg_res_out, torch.ones( ( batch_size, 1 ) ) )
-        l2_loss = self.transition_loss( pos_res_kg_prob, neg_res_kg_prob, torch.ones( ( batch_size, 1 ) ) )
-        l3_loss = self.joint_loss( pos_res_out, neg_res_out, pos_res_kg_prob, neg_res_kg_prob )
+        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
+        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
+        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
-        # regularization loss
-        item_idx = torch.unique( input_idx[:,1], sorted=True )
-        category_reg = self.kl_div_loss( res['category_kg'], self.reg_mat[ item_idx ] )
+        clustering_loss = None
+        if self.config['attribute'] == 'item_attribute':
+            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
+        elif self.config['attribute'] == 'user_attribute':
+            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
 
-        loss = l1_loss * self.alpha + l2_loss * self.beta + l3_loss + self.gamma * category_reg
+        user_distance, item_distance = self.model.mutual_distance()
 
-        self.log_dict({ 'loss' : loss.item() })
+        prediction_loss = l1_loss + l2_loss + l3_loss
+        regularization_loss = user_distance + item_distance
+
+        loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
 
         return loss
 
@@ -107,12 +112,13 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx = batch[0][:,0]
+        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
+        self.y_pred[ ~val_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -126,14 +132,16 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], None, is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx = batch[0][:,0]
+        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -142,13 +150,13 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        limit_train_batches=1,
-        max_epochs=1, 
+        gpus=1,
+        max_epochs=256,
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
@@ -160,7 +168,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
         ],
         progress_bar_refresh_rate=0
     )
@@ -189,24 +197,20 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=1,  _temp_dir='.' )
-    dataset = ray.put( Dataset( './process_datasets/pantip_dataset/user_interact_window_1_window_2.pt', batch_size=32 ) )
-    print( dataset )
+    ray.init( num_cpus=8, num_gpus=8 )
+    dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
         'num_latent' : 64,
+        'batch_size' : tune.grid_search([ 32, 128, 256 ]),
+        'num_group' : tune.grid_search([ 5, 10, 20, 30, 40, 50 ]),
 
         # hopefully will find right parameter
-        'prediction_margin' : tune.uniform( 1, 5 ),
-        'transition_margin' : tune.uniform( 0.01, 0.5 ),
-        'num_group' : tune.uniform(4,51),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
-        'lr' : tune.loguniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 10, 100 ),
-        'beta' : tune.uniform( 10, 100 ),
-        'mean_constraint' : tune.uniform( 2, 100 ),
-        'sigma_min' : tune.uniform( 0.1, 0.5 ),
-        'sigma_max' : tune.uniform( 5, 20 ),
+        'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
+        'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
+        'beta' : 1,
+        'gamma' : 1,
+        'lr' : 1e-4,
 
         # fix parameter
         'relation' : relation,
@@ -215,30 +219,26 @@ def tune_population_based( relation : str ):
         'ndcg_k' : 100
     }
 
-    algo = BayesOptSearch()
-    algo = ConcurrencyLimiter(algo, max_concurrent=50)
-
     scheduler = ASHAScheduler(
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
         metric='ndcg_score',
         mode='max',
-        num_samples=200,
         verbose=1,
+        num_samples=1,
         config=config,
         scheduler=scheduler,
-        search_alg=algo,
-        name=f'pantip_dataset_{relation}',
+        name=f'non_colapse_yelp_dataset_{relation}',
         keep_checkpoints_num=2,
-        local_dir=f"/data2/saito/",
+        local_dir=f"./",
         checkpoint_score_attr='ndcg_score',
     )
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( 'rooms' )
+    tune_population_based( sys.argv[1] )
