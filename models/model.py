@@ -153,13 +153,13 @@ class GmmExpectedKernel( nn.Module ):
         return torch.exp(
             0.5 * ( -\
                 torch.log( torch.prod( sigma_p + sigma_q, dim=1 ) ) -\
-                num_latent * torch.log( torch.tensor( [ 2 * math.pi ] ) ) -\
+                num_latent * math.log( 2 * math.pi ) -\
                 torch.sum( ( mu_p - mu_q ) ** 2 * ( 1 / ( sigma_p + sigma_q ) ), dim=1 )
             )
         )
 
     def compute_mixture_gaussian_expected_likehood( self, k1, k2, gaussian_mat ):
-        return torch.log( torch.linalg.multi_dot( ( k1, gaussian_mat, k2.T ) ) )
+        return torch.log( torch.chain_matmul( k1, gaussian_mat, k2.T  ) )
 
     def forward( self, k1, k2, p, q ):
         gaussian_mat = self.compute_gaussian_expected_likehood( p, q )
@@ -244,7 +244,7 @@ class ExpectedKernelModel( nn.Module ):
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
         transition_prob = self.normalize( kl_div_mat )
 
-        return torch.linalg.multi_dot( ( user_group_prob, transition_prob, item_group_prob.T ) )
+        return torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
 
     def clustering_assignment_hardening( self, group_prob ):
         square_group_prob = group_prob ** 2

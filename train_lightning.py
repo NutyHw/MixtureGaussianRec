@@ -150,7 +150,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -202,15 +202,18 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : tune.grid_search([ 32, 128, 256 ]),
-        'num_group' : tune.grid_search([ 5, 10, 20, 30, 40, 50 ]),
+        #'batch_size' : 128,
+        #'num_group' : 5,
+        #'prediction_margin' : 1,
+        #'transition_margin' : 0.01,
 
-        # hopefully will find right parameter
+        'batch_size' : tune.grid_search([ 32, 128, 256, 512 ]),
+        'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
         'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
         'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
         'beta' : 1,
         'gamma' : 1,
-        'lr' : 1e-4,
+        'lr' : 1e-3,
 
         # fix parameter
         'relation' : relation,
