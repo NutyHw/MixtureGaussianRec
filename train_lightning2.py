@@ -25,6 +25,8 @@ from ray.tune.suggest.bayesopt import BayesOptSearch
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
+
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
@@ -86,31 +88,25 @@ class ModelTrainer( pl.LightningModule ):
         unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
 
         mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
-        print( mixture.shape, transition.shape, user_mixture.shape, item_mixture.shape )
-        pos_mixture, neg_mixture = torch.hsplit( mixture[ inverse_user, inverse_item ], 2 )
-        pos_transition, neg_transition = torch.hsplit( transition[ inverse_user, inverse_item ], 2 )
+        pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
+        pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ) )
-        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ) )
+        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
+        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
         l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
-        category_loss = None
+        clustering_loss = None
         if self.config['attribute'] == 'item_attribute':
-            category_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ), item_mixture )
+            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
         elif self.config['attribute'] == 'user_attribute':
-            category_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ), user_mixture )
+            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
 
         user_distance, item_distance = self.model.mutual_distance()
 
-        user_clustering = self.model.clustering_assignment_hardening( user_mixture )
-        item_clustering = self.model.clustering_assignment_hardening( item_mixture )
-
         prediction_loss = l1_loss + l2_loss + l3_loss
-        clustering_loss = user_clustering + item_clustering
         regularization_loss = user_distance + item_distance
 
         loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
-        print(loss)
 
         return loss
 
@@ -118,8 +114,9 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx = batch[0][:,0]
+        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -137,8 +134,9 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        res = self.model( batch[0][:,0], torch.arange( self.n_items ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res ) )
+        user_idx = batch[0][:,0]
+        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
@@ -154,13 +152,13 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=1,
-        limit_train_batches=1,
+        gpus=1,
+        max_epochs=256,
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
@@ -201,19 +199,19 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_population_based( relation : str ):
-    ray.init( num_cpus=10,  _temp_dir='/data2/saito/ray_tmp/' )
+    ray.init( num_cpus=8, num_gpus=8 )
     dataset = ray.put( Dataset( relation ) )
     config = {
         # parameter to find
         'num_latent' : 64,
         'batch_size' : 32,
-        'num_group' : tune.uniform( 4, 101 ),
+        'num_group' : tune.uniform( 4, 50 ),
 
         # hopefully will find right parameter
         'prediction_margin' : tune.uniform( 1, 5 ),
-        'transition_margin' : tune.uniform( 0.05, 0.5 ),
+        'transition_margin' : tune.uniform( 0.05, 0.3 ),
         'beta' : tune.uniform( 1e-6, 1 ),
-        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'lr' : tune.uniform( 1e-4, 1e-2 ),
         'gamma' : tune.uniform( 1e-6, 1 ),
 
         # fix parameter
@@ -224,26 +222,26 @@ def tune_population_based( relation : str ):
     }
 
     algo = BayesOptSearch()
-    algo = ConcurrencyLimiter(algo, max_concurrent=12)
+    algo = ConcurrencyLimiter(algo, max_concurrent=8)
 
     scheduler = ASHAScheduler(
-        grace_period=1,
+        grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 1 },
+        resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
         metric='ndcg_score',
         mode='max',
         verbose=1,
-        num_samples=1,
+        num_samples=200,
         config=config,
         scheduler=scheduler,
         search_alg=algo,
         name=f'non_colapse_yelp_dataset_{relation}',
         keep_checkpoints_num=2,
-        local_dir=f"/data2/saito/",
+        local_dir=f"./",
         checkpoint_score_attr='ndcg_score',
     )
 

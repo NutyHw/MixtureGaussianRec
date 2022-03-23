@@ -31,7 +31,7 @@ class YelpDataset( Dataset ):
             self.save_data()
 
     def __len__( self ):
-        return self.n_users
+        return self.pos_interact.shape[0]
 
     def __getitem__( self, idx ):
         return self.pos_interact[ idx ], self.neg_interact[ idx ]
@@ -178,7 +178,7 @@ class YelpDataset( Dataset ):
             interact = torch.vstack( ( users, chosen_items ) ).T
             neg_interact = torch.vstack( ( neg_interact, interact ) )
 
-        self.pos_interact = self.train_adj_mat.nonzero().tile( 1, 2 ).reshape( -1, 2 )
+        self.pos_interact = self.train_adj_mat.nonzero()
         self.neg_interact = neg_interact
 
 
