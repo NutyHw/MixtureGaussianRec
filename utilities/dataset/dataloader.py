@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 
 class Scheduler( pl.Callback ):
     def on_train_epoch_end( self, trainer, pl_module ):
-        pl_module.dataset.sampling()
+        pl_module.dataset.samples()
 
 class GeneralDataLoader( pl.LightningDataModule ):
     def __init__( self, r : int, batch_size : int ):
