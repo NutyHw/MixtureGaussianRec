@@ -42,21 +42,18 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='none' )
+        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='none' )
         self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
-
-    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -89,9 +86,9 @@ class ModelTrainer( pl.LightningModule ):
         pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
-        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
-        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
+        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), - torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
+        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), - torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
+        l3_loss = torch.relu( - ( l1_loss * l2_loss ) )
 
         clustering_loss = None
         if self.config['attribute'] == 'item_attribute':
@@ -101,7 +98,7 @@ class ModelTrainer( pl.LightningModule ):
 
         user_distance, item_distance = self.model.mutual_distance()
 
-        prediction_loss = l1_loss + l2_loss + l3_loss
+        prediction_loss = torch.mean( l1_loss ) + torch.mean( l2_loss ) + torch.mean( l3_loss )
         regularization_loss = user_distance + item_distance
 
         loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
@@ -114,7 +111,7 @@ class ModelTrainer( pl.LightningModule ):
     def validation_step( self, batch, batch_idx ):
         user_idx = batch[0][:,0]
         res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - res.cpu() ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -134,7 +131,7 @@ class ModelTrainer( pl.LightningModule ):
     def test_step( self, batch, batch_idx ):
         user_idx = batch[0][:,0]
         res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
+        self.y_pred = torch.vstack( ( self.y_pred, - res.cpu() ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
