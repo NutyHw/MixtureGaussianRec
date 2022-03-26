@@ -105,7 +105,7 @@ class ModelTrainer( pl.LightningModule ):
         prediction_loss = torch.sum( l1_loss ) + torch.sum( l2_loss ) + torch.sum( l3_loss )
         regularization_loss = user_distance + item_distance
 
-        loss =  prediction_loss - self.config['gamma'] * regularization_loss + clustering_loss
+        loss =  prediction_loss - self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
         return loss
 
     def on_validation_epoch_start( self ):
@@ -150,7 +150,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -213,7 +213,8 @@ def tune_population_based( relation : str ):
         'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
         'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
         'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
-        'gamma' : 1,
+        'beta' : 1e-2,
+        'gamma' : 1e-2,
         'lr' : 1e-3,
 
         # fix parameter

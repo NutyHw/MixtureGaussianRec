@@ -78,8 +78,8 @@ class GaussianEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_normal_( self.params['mu'] )
-        nn.init.xavier_normal_( self.params['sigma'] )
+        nn.init.xavier_uniform_( self.params['mu'] )
+        nn.init.xavier_uniform_( self.params['sigma'] )
 
     def forward( self ):
         return torch.hstack( ( self.params['mu'], torch.exp( self.params['sigma'] ) ) )
@@ -88,10 +88,7 @@ class MixtureEmbedding( nn.Module ):
     def __init__( self, num_mixture, n ):
         super().__init__()
         self.mixture = nn.Embedding( num_embeddings=n, embedding_dim=num_mixture )
-        self.init_xavior()
-
-    def init_xavior( self ):
-        nn.init.xavier_normal_( self.mixture.weight )
+        self.mixture.weight = nn.Parameter( F.one_hot( torch.arange( n ) % num_mixture ).to( torch.float ) )
     
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
@@ -330,7 +327,7 @@ class ExpectedKernelModel( nn.Module ):
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
-   mixture_prob, transition_prob, user_group_prob, item_group_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) 
+   mixture_prob, transition_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) 
    print( mixture_prob )
    print( transition_prob )
 
