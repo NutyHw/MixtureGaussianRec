@@ -166,7 +166,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
         ],
         progress_bar_refresh_rate=0
     )
