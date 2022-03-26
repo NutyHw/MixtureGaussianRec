@@ -28,6 +28,7 @@ os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
+        self.is_prediction_loss = True
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
@@ -82,7 +83,7 @@ class ModelTrainer( pl.LightningModule ):
         unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
         unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
 
-        mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
+        mixture, transition = self.model( unique_user, unique_item )
         pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
@@ -90,19 +91,21 @@ class ModelTrainer( pl.LightningModule ):
         l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
         l3_loss = torch.relu( - ( l1_loss * l2_loss ) )
 
+        user_mixture = self.model.user_mixture( torch.arange( self.n_users ).type_as( unique_user) )
+        item_mixture = self.model.item_mixture( torch.arange( self.n_items ).type_as( unique_item ) )
+
         clustering_loss = None
         if self.config['attribute'] == 'item_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
+            clustering_loss = self.kl_div( torch.log( self.true_category ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
         elif self.config['attribute'] == 'user_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
+            clustering_loss = self.kl_div( torch.log( self.true_category ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
 
         user_distance, item_distance = self.model.mutual_distance()
 
-        prediction_loss = torch.mean( l1_loss ) + torch.mean( l2_loss ) + torch.mean( l3_loss )
+        prediction_loss = torch.sum( l1_loss ) + torch.sum( l2_loss ) + torch.sum( l3_loss )
         regularization_loss = user_distance + item_distance
 
-        loss =  prediction_loss - self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
-
+        loss =  prediction_loss - self.config['gamma'] * regularization_loss + clustering_loss
         return loss
 
     def on_validation_epoch_start( self ):
@@ -147,14 +150,13 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], momentum=0.9 )
+        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=1,
-        limit_train_batches=1,
+        max_epochs=256,
         num_sanity_val_steps=0,
         callbacks=[
             Scheduler(),
@@ -200,18 +202,17 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 256,
-        'num_group' : 5,
-        'prediction_margin' : 1,
-        'transition_margin' : 0.01,
-        'gibb_beta' : 1,
+        #'batch_size' : 256,
+        #'num_group' : 5,
+        #'prediction_margin' : 1,
+        #'transition_margin' : 0.01,
+        #'gibb_beta' : 1,
 
-        #'batch_size' : tune.grid_search([ 32, 128, 256, 512 ]),
-        #'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
-        #'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
-        #'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
-        #'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
-        'beta' : 1,
+        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
+        'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
+        'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
+        'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
         'gamma' : 1,
         'lr' : 1e-3,
 

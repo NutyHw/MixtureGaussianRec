@@ -265,7 +265,7 @@ class ExpectedKernelModel( nn.Module ):
             return mixture_kl_div
         else:
             user_group_prob, item_group_prob = self.compute_group_prob( mixture_1, mixture_2, gaussian_1, gaussian_2 )
-            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), user_group_prob, item_group_prob
+            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat )
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
