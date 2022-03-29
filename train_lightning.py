@@ -238,7 +238,8 @@ def tune_population_based( relation : str ):
         'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
         'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
         'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
-        'gamma' : 1,
+        'beta' : 1e-2,
+        'gamma' : 1e-2,
         'lr' : 1e-3,
 
         # fix parameter

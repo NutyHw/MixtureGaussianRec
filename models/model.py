@@ -92,7 +92,7 @@ class MixtureEmbedding( nn.Module ):
 
     def init_xavior( self ):
         nn.init.xavier_uniform_( self.mixture.weight )
-    
+
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
 
@@ -329,7 +329,7 @@ class ExpectedKernelModel( nn.Module ):
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
-   mixture_prob, transition_prob, user_group_prob, item_group_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) 
+   mixture_prob, transition_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) 
    print( mixture_prob )
    print( transition_prob )
 
