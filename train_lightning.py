@@ -28,7 +28,7 @@ os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
-        self.is_prediction_loss = True
+        self.mode = True
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
@@ -106,7 +106,19 @@ class ModelTrainer( pl.LightningModule ):
         regularization_loss = user_distance + item_distance
 
         loss =  prediction_loss - self.config['gamma'] * regularization_loss + clustering_loss
-        return loss
+
+        mixture_optimizer, gaussian_optimizer = self.optimizers()
+
+        chosen_opt = None
+        if self.mode:
+            chosen_opt = mixture_optimizer
+        else:
+            chosen_opt = gaussian_optimizer
+
+        print( self.current_epoch )
+        chosen_opt.zero_grad( set_to_none=True )
+        self.manual_backward( loss )
+        chosen_opt.step()
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
@@ -150,8 +162,21 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
-        return optimizer
+        # optimize only mixture ratio
+        self.model.user_gaussian.params['mu'].requires_grad = False
+        self.model.user_gaussian.params['sigma'].requires_grad = False
+
+        mixture_optimizer = optim.Adagrad( filter( lambda p : p.requires_grad, self.parameters() ) )
+
+        # optimize only gaussian
+        self.model.user_gaussian.params['mu'].requires_grad = True
+        self.model.user_gaussian.params['sigma'].requires_grad = True
+        self.model.user_mixture.mixture.weight.requires_grad = False
+        self.model.item_mixture.mixture.weight.requires_grad = False
+        
+        gaussian_optimizer = optim.Adagrad( filter( lambda p : p.requires_grad, self.parameters() ) )
+
+        return mixture_optimizer, gaussian_optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(

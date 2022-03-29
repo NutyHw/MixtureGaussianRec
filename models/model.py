@@ -78,8 +78,8 @@ class GaussianEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_normal_( self.params['mu'] )
-        nn.init.xavier_normal_( self.params['sigma'] )
+        nn.init.xavier_uniform_( self.params['mu'] )
+        nn.init.xavier_uniform_( self.params['sigma'] )
 
     def forward( self ):
         return torch.hstack( ( self.params['mu'], torch.exp( self.params['sigma'] ) ) )
@@ -91,7 +91,7 @@ class MixtureEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_normal_( self.mixture.weight )
+        nn.init.xavier_uniform_( self.mixture.weight )
     
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
@@ -228,7 +228,7 @@ class ExpectedKernelModel( nn.Module ):
         user_distance = torch.sum( F.pdist( user_mu, 2 ) )
         item_distance = torch.sum( F.pdist( item_mu, 2 ) )
 
-        return user_distance / self.num_user_mixture ** 2, item_distance / self.num_item_mixture ** 2
+        return ( 2 * user_distance ) / self.num_user_mixture ** 2, ( 2 * item_distance ) / self.num_item_mixture ** 2
 
     def compute_group_prob( self, mixture_1, mixture_2, gaussian_1, gaussian_2 ):
         user_group_mixture, _ = self.expected_kernel( mixture_1, F.one_hot( torch.arange( self.num_user_mixture ) ).type_as( mixture_1 ), gaussian_1, gaussian_1 )
@@ -240,8 +240,7 @@ class ExpectedKernelModel( nn.Module ):
         return user_group_prob, item_group_prob
 
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
-        kl_div_mat = kl_div_mat * self.beta
-        transition_prob = kl_div_mat / torch.sum( kl_div_mat, dim=-1 ).reshape( -1, 1 )
+        transition_prob = torch.softmax( kl_div_mat * self.beta, dim=-1 )
 
         return torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
 
@@ -265,7 +264,7 @@ class ExpectedKernelModel( nn.Module ):
             return mixture_kl_div
         else:
             user_group_prob, item_group_prob = self.compute_group_prob( mixture_1, mixture_2, gaussian_1, gaussian_2 )
-            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat )
+            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), mixture_1, mixture_2
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
