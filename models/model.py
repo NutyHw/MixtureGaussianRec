@@ -216,6 +216,7 @@ class ExpectedKernelModel( nn.Module ):
         self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
         self.user_mixture = MixtureEmbedding( user_mixture, n_users )
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
+        self.compute_prob = nn.Linear( 1, 1, bias=True )
         self.expected_kernel = GmmExpectedKernel()
 
     def mutual_distance( self ):
@@ -230,18 +231,16 @@ class ExpectedKernelModel( nn.Module ):
 
         return ( 2 * user_distance ) / self.num_user_mixture ** 2, ( 2 * item_distance ) / self.num_item_mixture ** 2
 
-    def compute_group_prob( self, mixture_1, mixture_2, gaussian_1, gaussian_2 ):
-        user_group_mixture, _ = self.expected_kernel( mixture_1, F.one_hot( torch.arange( self.num_user_mixture ) ).type_as( mixture_1 ), gaussian_1, gaussian_1 )
-        item_group_mixture, _ = self.expected_kernel( mixture_2, F.one_hot( torch.arange( self.num_item_mixture ) ).type_as( mixture_2 ), gaussian_2, gaussian_2 )
+    def compute_mixture_to_prob( self, mixture ):
+        norm_mixture = ( mixture - torch.mean( mixture, dim=-1 ).reshape( -1, 1 ) ) / torch.std( mixture, dim=-1 ).reshape( -1, 1 )
+        prob = torch.sigmoid( self.compute_prob( norm_mixture.reshape( -1, 1 ) ).reshape( mixture.shape ) )
 
-        user_group_prob = torch.softmax( user_group_mixture * self.beta, dim=-1 )
-        item_group_prob = torch.softmax( item_group_mixture * self.beta, dim=-1 )
-
-        return user_group_prob, item_group_prob
+        return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
-        transition_prob = torch.softmax( kl_div_mat * self.beta, dim=-1 )
-        res = torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
+        norm_mixture = ( kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) ) / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
+        prob = torch.sigmoid( self.compute_prob( norm_mixture.reshape( -1, 1 ) ).reshape( kl_div_mat.shape ) )
+        res = torch.chain_matmul( user_group_prob, prob, item_group_prob.T ) 
 
         return res / torch.sum( res, dim=-1 ).reshape( -1, 1 )
 
@@ -264,8 +263,7 @@ class ExpectedKernelModel( nn.Module ):
         if is_test:
             return mixture_kl_div
         else:
-            user_group_prob, item_group_prob = self.compute_group_prob( mixture_1, mixture_2, gaussian_1, gaussian_2 )
-            return torch.softmax( self.beta * mixture_kl_div, dim=-1 ), self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), mixture_1, mixture_2
+            return self.compute_mixture_to_prob( mixture_kl_div ), self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
