@@ -15,10 +15,7 @@ class YelpDataset( Dataset ):
             self.process_dir = './process_datasets/yelp/'
             self.relation = relation
             self.load_data()
-            self.samples()
-            # self.sampling()
         else:
-            self.sample_size = 5
             self.UB, self.UU, self.UCom, self.BCat, self.BCity = self.load_dataset()
 
             self.BCat, self.BCity, self.UU, self.UCom = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity ), self.preprocess_relation( self.UU ), self.preprocess_relation( self.UCom )
@@ -31,10 +28,10 @@ class YelpDataset( Dataset ):
             self.save_data()
 
     def __len__( self ):
-        return self.pos_interact.shape[0]
+        return self.n_users
 
     def __getitem__( self, idx ):
-        return self.pos_interact[ idx ], self.neg_interact[ idx ]
+        return idx, self.train_adj_mat[ idx ]
 
     def get_val( self ):
         return self.val_mask, self.val_score
@@ -46,7 +43,7 @@ class YelpDataset( Dataset ):
         dataset = torch.load( os.path.join( self.process_dir, 'dataset.pt' ) )
         train_adj_mat = dataset['train_adj_mat']
 
-        # train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
+        train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
         self.train_adj_mat = train_adj_mat
         self.val_mask = dataset['val_mask']
         self.val_score = dataset['val_score']
@@ -184,3 +181,4 @@ class YelpDataset( Dataset ):
 
 if __name__ == '__main__':
     dataset = YelpDataset( 'UCom', is_preprocess=False )
+    print( dataset[0] )

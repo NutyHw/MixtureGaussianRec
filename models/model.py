@@ -241,8 +241,9 @@ class ExpectedKernelModel( nn.Module ):
 
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
         transition_prob = torch.softmax( kl_div_mat * self.beta, dim=-1 )
+        res = torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
 
-        return torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
+        return res / torch.sum( res, dim=-1 ).reshape( -1, 1 )
 
     def clustering_assignment_hardening( self, group_prob ):
         square_group_prob = group_prob ** 2
@@ -251,9 +252,9 @@ class ExpectedKernelModel( nn.Module ):
 
         return F.kl_div( torch.log( P ), group_prob, reduction='sum' )
 
-    def forward( self, user_idx, item_idx, is_test=False ):
+    def forward( self, user_idx, is_test=False ):
         mixture_1 = self.user_mixture( user_idx )
-        mixture_2 = self.item_mixture( item_idx )
+        mixture_2 = self.item_mixture( torch.arange( self.n_items ).type_as( user_idx ) )
 
         gaussian_1 = self.user_gaussian()
         gaussian_2 = self.item_gaussian()
@@ -264,7 +265,7 @@ class ExpectedKernelModel( nn.Module ):
             return mixture_kl_div
         else:
             user_group_prob, item_group_prob = self.compute_group_prob( mixture_1, mixture_2, gaussian_1, gaussian_2 )
-            return mixture_kl_div, self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), mixture_1, mixture_2
+            return torch.softmax( self.beta * mixture_kl_div, dim=-1 ), self.compute_transition_prob( user_group_prob, item_group_prob, kl_div_mat ), mixture_1, mixture_2
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
@@ -329,7 +330,7 @@ class ExpectedKernelModel( nn.Module ):
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
-   mixture_prob, transition_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 5 ) ) 
+   mixture_prob, transition_prob, user_mixture, item_mixture = model( torch.tensor([ 2, 3 ]).to( torch.long ) )
    print( mixture_prob )
    print( transition_prob )
 

@@ -5,7 +5,7 @@ import numpy as np
 from functools import partial
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from models.model import ExpectedKernelModel as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
@@ -17,8 +17,6 @@ import ray
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
-from ray.tune.suggest import ConcurrencyLimiter
-from ray.tune.suggest.bayesopt import BayesOptSearch
 
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
@@ -43,10 +41,6 @@ class ModelTrainer( pl.LightningModule ):
             config['attribute'] = 'item_attribute'
             self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='none' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='none' )
-        self.kl_div = nn.KLDivLoss( size_average='sum' )
-
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
@@ -55,6 +49,9 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+
+    def cross_entropy( self, predict_prob , true_prob ):
+        return torch.sum( true_prob * torch.log( predict_prob ), dim=-1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -76,56 +73,34 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact = batch
-        batch_size = pos_interact.shape[0]
-
-        input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
-        unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
-        unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
-
-        mixture, transition = self.model( unique_user, unique_item )
-        pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
-        pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
-
-        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
-        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
-        l3_loss = torch.relu( - ( l1_loss * l2_loss ) )
-
-        user_mixture = self.model.user_mixture( torch.arange( self.n_users ).type_as( unique_user) )
-        item_mixture = self.model.item_mixture( torch.arange( self.n_items ).type_as( unique_item ) )
+        user_idx, adj_mat = batch
+        mixture, transition, user_mixture, item_mixture = self.model( user_idx )
 
         clustering_loss = None
         if self.config['attribute'] == 'item_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
+            clustering_loss = F.kl_div( torch.log( self.true_category ).type_as( item_mixture ), item_mixture, reduction='sum' ) + self.model.clustering_assignment_hardening( user_mixture )
         elif self.config['attribute'] == 'user_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
+            clustering_loss = F.kl_div( torch.log( self.true_category[ user_idx ] ).type_as( user_mixture ), user_mixture, reduction='sum' ) + self.model.clustering_assignment_hardening( item_mixture )
 
         user_distance, item_distance = self.model.mutual_distance()
 
-        prediction_loss = torch.sum( l1_loss ) + torch.sum( l2_loss ) + torch.sum( l3_loss )
+        l1_loss = self.cross_entropy( mixture, adj_mat )
+        l2_loss = self.cross_entropy( transition, adj_mat )
+        l3_loss = F.kl_div( torch.log( transition ), mixture, reduction='none' )
+
+        prediction_loss = torch.mean( l1_loss ) + torch.mean( l2_loss ) + torch.mean( l3_loss )
         regularization_loss = user_distance + item_distance
 
         loss =  prediction_loss - self.config['gamma'] * regularization_loss + clustering_loss
 
-        mixture_optimizer, gaussian_optimizer = self.optimizers()
-
-        chosen_opt = None
-        if self.mode:
-            chosen_opt = mixture_optimizer
-        else:
-            chosen_opt = gaussian_optimizer
-
-        print( self.current_epoch )
-        chosen_opt.zero_grad( set_to_none=True )
-        self.manual_backward( loss )
-        chosen_opt.step()
+        return loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
         user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        res = self.model( user_idx, is_test=True )
         self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_validation_epoch_end( self ):
@@ -145,7 +120,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def test_step( self, batch, batch_idx ):
         user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
+        res = self.model( user_idx, is_test=True )
         self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
 
     def on_test_epoch_end( self ):
@@ -163,20 +138,7 @@ class ModelTrainer( pl.LightningModule ):
 
     def configure_optimizers( self ):
         # optimize only mixture ratio
-        self.model.user_gaussian.params['mu'].requires_grad = False
-        self.model.user_gaussian.params['sigma'].requires_grad = False
-
-        mixture_optimizer = optim.Adagrad( filter( lambda p : p.requires_grad, self.parameters() ) )
-
-        # optimize only gaussian
-        self.model.user_gaussian.params['mu'].requires_grad = True
-        self.model.user_gaussian.params['sigma'].requires_grad = True
-        self.model.user_mixture.mixture.weight.requires_grad = False
-        self.model.item_mixture.mixture.weight.requires_grad = False
-        
-        gaussian_optimizer = optim.Adagrad( filter( lambda p : p.requires_grad, self.parameters() ) )
-
-        return mixture_optimizer, gaussian_optimizer
+        return optim.SGD( self.parameters(), lr=self.config['lr'] )
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
@@ -229,15 +191,11 @@ def tune_population_based( relation : str ):
         'num_latent' : 64,
         #'batch_size' : 256,
         #'num_group' : 5,
-        #'prediction_margin' : 1,
-        #'transition_margin' : 0.01,
         #'gibb_beta' : 1,
 
-        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'batch_size' : tune.grid_search([ 16, 32, 64, 128 ]),
         'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
-        'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
-        'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
-        'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
+        'gibb_beta' : tune.grid_search([ 0.01, 0.1, 1, 3, 5 ]),
         'beta' : 1e-2,
         'gamma' : 1e-2,
         'lr' : 1e-3,
