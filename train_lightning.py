@@ -31,29 +31,33 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
+        print( self.n_users, self.n_items )
 
         self.true_category = self.dataset.get_reg_mat()
         config['num_group'] = int( round( self.config['num_group'] ) )
 
         if self.true_category.shape[0] == self.n_users:
             config['attribute'] = 'user_attribute'
-            self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent']  )
+            self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent'] , config['gibb_beta'] )
         else:
             config['attribute'] = 'item_attribute'
-            self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent']  )
+            self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
 
-        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='none' )
-        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='none' )
+        self.prediction_loss = nn.MarginRankingLoss( margin=config['prediction_margin'], reduction='mean' )
+        self.transition_loss = nn.MarginRankingLoss( margin=config['transition_margin'], reduction='mean' )
         self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
 
     def val_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def test_dataloader( self ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+
+    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
+        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -86,9 +90,9 @@ class ModelTrainer( pl.LightningModule ):
         pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), - torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
-        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), - torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
-        l3_loss = torch.relu( - ( l1_loss * l2_loss ) )
+        l1_loss = self.prediction_loss( pos_mixture.reshape( -1, 1 ), neg_mixture.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( pos_mixture ) )
+        l2_loss = self.transition_loss( pos_transition.reshape( -1, 1 ), neg_transition.reshape( -1, 1 ), torch.ones( ( batch_size, 1 ) ).type_as( neg_mixture ) ) 
+        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
         clustering_loss = None
         if self.config['attribute'] == 'item_attribute':
@@ -98,10 +102,10 @@ class ModelTrainer( pl.LightningModule ):
 
         user_distance, item_distance = self.model.mutual_distance()
 
-        prediction_loss = torch.mean( l1_loss ) + torch.mean( l2_loss ) + torch.mean( l3_loss )
+        prediction_loss = l1_loss + l2_loss + l3_loss
         regularization_loss = user_distance + item_distance
 
-        loss =  prediction_loss + self.config['gamma'] * regularization_loss - self.config['beta'] * clustering_loss
+        loss =  prediction_loss - self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
 
         return loss
 
@@ -204,13 +208,14 @@ def tune_population_based( relation : str ):
         #'prediction_margin' : 1,
         #'transition_margin' : 0.01,
 
-        'batch_size' : tune.grid_search([ 32, 128, 256, 512 ]),
+        'batch_size' : 32,
         'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
-        'prediction_margin' : tune.grid_search([ 1, 2, 3, 4, 5 ]),
-        #'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.2, 0.3 ]),
+        'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
+        'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
+        'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
         'beta' : 1,
         'gamma' : 1,
-        'lr' : 1e-3,
+        'lr' : 1e-4,
 
         # fix parameter
         'relation' : relation,
@@ -233,7 +238,7 @@ def tune_population_based( relation : str ):
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'non_colapse_yelp_dataset_{relation}',
+        name=f'non_colapse_yelp_dataset_{relation}_2',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg_score',
