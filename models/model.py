@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 # from torch_geometric.nn import MessagePassing
 # from torch_geometric.utils import add_self_loops, degree
-#from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader
 # from ml1m_dataset import Ml1mDataset as Dataset
 
 # class GCN( MessagePassing ):
@@ -78,8 +78,8 @@ class GaussianEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_uniform_( self.params['mu'] )
-        nn.init.xavier_uniform_( self.params['sigma'] )
+        nn.init.xavier_normal_( self.params['mu'] )
+        nn.init.xavier_normal_( self.params['sigma'] )
 
     def forward( self ):
         return torch.hstack( ( self.params['mu'], torch.exp( self.params['sigma'] ) ) )
@@ -91,8 +91,8 @@ class MixtureEmbedding( nn.Module ):
         self.init_xavior()
 
     def init_xavior( self ):
-        nn.init.xavier_uniform_( self.mixture.weight )
-
+        nn.init.xavier_normal_( self.mixture.weight )
+    
     def forward( self, idx ):
         return torch.softmax( self.mixture( idx ), dim=-1 )
 
@@ -216,7 +216,6 @@ class ExpectedKernelModel( nn.Module ):
         self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
         self.user_mixture = MixtureEmbedding( user_mixture, n_users )
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
-        self.compute_prob = nn.Linear( 1, 1, bias=True )
         self.expected_kernel = GmmExpectedKernel()
 
     def mutual_distance( self ):
@@ -231,29 +230,21 @@ class ExpectedKernelModel( nn.Module ):
 
         return ( 2 * user_distance ) / self.num_user_mixture ** 2, ( 2 * item_distance ) / self.num_item_mixture ** 2
 
-    def compute_mixture_to_prob( self, mixture ):
-        norm_mixture = ( mixture - torch.mean( mixture, dim=-1 ).reshape( -1, 1 ) ) / torch.std( mixture, dim=-1 ).reshape( -1, 1 )
-        prob = torch.sigmoid( self.compute_prob( norm_mixture.reshape( -1, 1 ) ).reshape( mixture.shape ) )
-
-        return prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
-
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
-        norm_mixture = ( kl_div_mat - torch.mean( kl_div_mat, dim=-1 ).reshape( -1, 1 ) ) / torch.std( kl_div_mat, dim=-1 ).reshape( -1, 1 )
-        prob = torch.sigmoid( self.compute_prob( norm_mixture.reshape( -1, 1 ) ).reshape( kl_div_mat.shape ) )
-        res = torch.chain_matmul( user_group_prob, prob, item_group_prob.T ) 
+        transition_prob = torch.softmax( torch.log( kl_div_mat ) * self.beta, dim=-1 )
 
-        return res / torch.sum( res, dim=-1 ).reshape( -1, 1 )
+        return torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
 
     def clustering_assignment_hardening( self, group_prob ):
         square_group_prob = group_prob ** 2
-        P = ( square_group_prob / torch.sum( group_prob, dim=0 ).reshape( 1, -1 ) ) /\
-            torch.sum( square_group_prob / torch.sum( group_prob, dim=0 ).reshape( 1, -1 ), dim=-1 ).reshape( -1, 1 )
+        temp = square_group_prob / torch.sum( group_prob, dim=0 ).reshape( 1, -1 )
+        P = temp / torch.sum( temp, dim=1 ).reshape( -1, 1 )
 
         return F.kl_div( torch.log( P ), group_prob, reduction='sum' )
 
-    def forward( self, user_idx, is_test=False ):
+    def forward( self, user_idx, item_idx, is_test=False ):
         mixture_1 = self.user_mixture( user_idx )
-        mixture_2 = self.item_mixture( torch.arange( self.n_items ).type_as( user_idx ) )
+        mixture_2 = self.item_mixture( item_idx )
 
         gaussian_1 = self.user_gaussian()
         gaussian_2 = self.item_gaussian()
@@ -263,7 +254,7 @@ class ExpectedKernelModel( nn.Module ):
         if is_test:
             return mixture_kl_div
         else:
-            return self.compute_mixture_to_prob( mixture_kl_div ), self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
+            return mixture_kl_div, self.compute_transition_prob( mixture_1, mixture_2, kl_div_mat ), mixture_1, mixture_2
 
 #class DistanceKlDiv( nn.Module ):
 #    def __init__( self, n_users, n_items, n_mixture, n_latent, attribute  ):
@@ -328,7 +319,7 @@ class ExpectedKernelModel( nn.Module ):
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
-   mixture_prob, transition_prob, user_mixture, item_mixture = model( torch.tensor([ 2, 3 ]).to( torch.long ) )
+   mixture_prob, transition_prob, user_group_prob, item_group_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 20 ) ) 
    print( mixture_prob )
    print( transition_prob )
 
