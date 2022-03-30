@@ -31,6 +31,7 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
+        print( self.n_users, self.n_items )
 
         self.true_category = self.dataset.get_reg_mat()
         config['num_group'] = int( round( self.config['num_group'] ) )
@@ -168,7 +169,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
         ],
         progress_bar_refresh_rate=0
     )
@@ -206,8 +207,9 @@ def tune_population_based( relation : str ):
         #'num_group' : 5,
         #'prediction_margin' : 1,
         #'transition_margin' : 0.01,
+        #'gibb_beta' : 1,
 
-        'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
+        'batch_size' : 256,
         'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
         'prediction_margin' : tune.grid_search([ 1, 3, 5 ]),
         'transition_margin' : tune.grid_search([ 0.01, 0.1, 0.3 ]),
