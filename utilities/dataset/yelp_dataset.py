@@ -30,10 +30,10 @@ class YelpDataset( Dataset ):
         return self.pos_interact.shape[0]
 
     def __getitem__( self, idx ):
-        return self.pos_interact[ idx ], self.neg_interact[ idx ]
+        return self.pos_interact[ idx ], self.neg_interact[ idx ], self.weight[ idx ]
 
     def get_val( self ):
-        return self.val_mask, self.val_score
+        return self.test_mask, self.test_score
 
     def get_test( self ):
         return self.test_mask, self.test_score
@@ -42,7 +42,7 @@ class YelpDataset( Dataset ):
         dataset = torch.load( os.path.join( self.process_dir, 'dataset.pt' ) )
         train_adj_mat = dataset['train_adj_mat']
 
-        # train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
+        train_adj_mat = train_adj_mat / torch.sum( train_adj_mat, dim=-1 ).reshape( -1, 1 )
         self.train_adj_mat = train_adj_mat
         self.val_mask = dataset['val_mask']
         self.val_score = dataset['val_score']
@@ -105,6 +105,7 @@ class YelpDataset( Dataset ):
 
     def train_test_val_split( self, UB ):
         user_biz = defaultdict(list)
+        item_biz = defaultdict(list)
 
         for u, b in zip(UB.row, UB.col):
             user_biz[u].append(b)
@@ -114,8 +115,8 @@ class YelpDataset( Dataset ):
         pos_test_interact = torch.zeros( ( 0, 2 ), dtype=torch.long )
 
         for u in user_biz:
-            if len(user_biz[u]) >= 5:
-                val = int( len(user_biz[u]) * 0.6 )
+            if len(user_biz[u]) >= 10:
+                val = int( len(user_biz[u]) * 0.8 )
                 test = int( len(user_biz[u]) * 0.8 )
 
                 random.shuffle(user_biz[u])
@@ -141,11 +142,18 @@ class YelpDataset( Dataset ):
         val_adj_mat[ pos_val_interact[:,0], pos_val_interact[:,1] ] = 1
         test_adj_mat[ pos_test_interact[:,0], pos_test_interact[:,1] ] = 1
 
+        # filter_item_less_than_10 = torch.sum( train_adj_mat + val_adj_mat + test_adj_mat, dim=0 ) > 9
+        # train_adj_mat = train_adj_mat[ :, filter_item_less_than_10 ]
+        # val_adj_mat = val_adj_mat[ :, filter_item_less_than_10 ]
+        # test_adj_mat = test_adj_mat[ :, filter_item_less_than_10 ]
+        # self.BCat = self.BCat[ filter_item_less_than_10 ]
+        # self.BCity = self.BCity[ filter_item_less_than_10 ]
+
         train_item_mask = torch.sum( train_adj_mat, dim=0 ) > 0
-        val_item_mask = torch.sum( val_adj_mat, dim=0 ) > 0
+        # val_item_mask = torch.sum( val_adj_mat, dim=0 ) > 0
         test_item_mask = torch.sum( test_adj_mat, dim=0 ) > 0
 
-        item_mask = train_item_mask * val_item_mask * test_item_mask
+        item_mask = train_item_mask * test_item_mask
         train_adj_mat = train_adj_mat[ :, item_mask ]
         val_adj_mat = val_adj_mat[ :, item_mask ]
         test_adj_mat = test_adj_mat[ :, item_mask ]
@@ -154,7 +162,7 @@ class YelpDataset( Dataset ):
         val_user_mask = torch.sum( val_adj_mat, dim=1 ) > 0
         test_user_mask = torch.sum( test_adj_mat, dim=1 ) > 0
 
-        user_mask = train_user_mask * val_user_mask * test_user_mask
+        user_mask = train_user_mask * test_user_mask
         train_adj_mat = train_adj_mat[ user_mask ]
         val_adj_mat = val_adj_mat[ user_mask ]
         test_adj_mat = test_adj_mat[ user_mask ]
@@ -204,8 +212,9 @@ class YelpDataset( Dataset ):
 
         self.pos_interact = self.train_adj_mat.nonzero()
         self.neg_interact = neg_interact
+        self.weight = self.train_adj_mat[ self.pos_interact[:,0], self.pos_interact[:,1] ]
 
 
 if __name__ == '__main__':
-    dataset = YelpDataset( 'UCom', is_preprocess=True )
-    print( dataset.n_users, dataset.n_items )
+    dataset = YelpDataset( 'UCom', is_preprocess=False )
+    print( dataset[0] )
