@@ -55,7 +55,7 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
 
     def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.mean( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
+        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -88,8 +88,8 @@ class ModelTrainer( pl.LightningModule ):
         pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        l1_loss = torch.mean( torch.sigmoid( neg_mixture.reshape( -1, 1 ) - pos_mixture.reshape( -1, 1 ) ) )
-        l2_loss = torch.mean( torch.sigmoid( neg_transition.reshape( -1, 1 ) - pos_transition.reshape( -1, 1 ) ) )
+        l1_loss = - torch.sum( torch.log( torch.sigmoid( pos_mixture.reshape( -1, 1 ) - neg_mixture.reshape( -1, 1 ) ) ) )
+        l2_loss = - torch.sum( torch.log( torch.sigmoid( pos_mixture.reshape( -1, 1 ) - neg_mixture.reshape( -1, 1 ) ) ) )
         l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
         clustering_loss = None
@@ -101,9 +101,10 @@ class ModelTrainer( pl.LightningModule ):
         user_distance, item_distance = self.model.mutual_distance()
 
         prediction_loss = l1_loss + l2_loss + l3_loss
-        regularization_loss = user_distance + item_distance
+        mutual_loss = user_distance + item_distance
+        regularization_loss = self.model.regularization()
 
-        loss =  prediction_loss - self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
+        loss =  prediction_loss - mutual_loss + self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
 
         return loss
 
@@ -149,7 +150,7 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adagrad( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.RMSprop( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):

@@ -218,20 +218,26 @@ class ExpectedKernelModel( nn.Module ):
         self.item_mixture = MixtureEmbedding( item_mixture, n_items )
         self.kl_div_kernel = GMMKlDiv()
 
+    def regularization( self ):
+        user_gaussian = self.user_gaussian()
+        item_gaussian = self.item_gaussian()
+        gaussian = torch.vstack( ( user_gaussian, item_gaussian ) )
+
+        mu, sigma = torch.chunk( gaussian, 2, dim=1 )
+
+        return 0.5 * ( torch.sum( mu ** 2 ) + torch.sum( sigma ) - self.num_latent - torch.sum( torch.prod( sigma, dim=1 ) ) )
+
     def mutual_distance( self ):
         user_gaussian = self.user_gaussian()
         item_gaussian = self.item_gaussian()
 
-        user_mu = user_gaussian[ :, : self.num_latent ]
-        item_mu = item_gaussian[ :, : self.num_latent ]
+        user_kl_div = self.kl_div_kernel.compute_kl_div( user_gaussian, user_gaussian )
+        item_kl_div = self.kl_div_kernel.compute_kl_div( item_gaussian, item_gaussian )
 
-        user_distance = torch.sum( F.pdist( user_mu, 2 ) )
-        item_distance = torch.sum( F.pdist( item_mu, 2 ) )
-
-        return ( 2 * user_distance ) / self.num_user_mixture ** 2, ( 2 * item_distance ) / self.num_item_mixture ** 2
+        return torch.sum( user_kl_div ), torch.sum( item_kl_div )
 
     def compute_transition_prob( self, user_group_prob, item_group_prob, kl_div_mat ):
-        transition_prob = torch.softmax( torch.log( kl_div_mat ) * self.beta, dim=-1 )
+        transition_prob = torch.softmax( - kl_div_mat * self.beta, dim=-1 )
 
         return torch.chain_matmul( user_group_prob, transition_prob, item_group_prob.T ) 
 
@@ -320,6 +326,6 @@ if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
    model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
    mixture_prob, transition_prob, user_group_prob, item_group_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 20 ) ) 
-   print( mixture_prob )
-   print( transition_prob )
+   print( model.mutual_distance() )
+   print( model.regularization() )
 
