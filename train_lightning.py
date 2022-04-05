@@ -77,7 +77,7 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact = batch
+        pos_interact, neg_interact, weight = batch
         batch_size = pos_interact.shape[0]
 
         input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
@@ -88,8 +88,8 @@ class ModelTrainer( pl.LightningModule ):
         pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
         pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
 
-        l1_loss = - torch.sum( torch.log( torch.sigmoid( pos_mixture.reshape( -1, 1 ) - neg_mixture.reshape( -1, 1 ) ) ) )
-        l2_loss = - torch.sum( torch.log( torch.sigmoid( pos_mixture.reshape( -1, 1 ) - neg_mixture.reshape( -1, 1 ) ) ) )
+        l1_loss = - torch.sum( torch.log( torch.sigmoid( neg_mixture.reshape( -1, 1 ) - pos_mixture.reshape( -1, 1 ) ) ) )
+        l2_loss = - torch.sum( torch.log( torch.sigmoid( neg_transition.reshape( -1, 1 ) - pos_transition.reshape( -1, 1 ) ) ) )
         l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
         clustering_loss = None
@@ -104,7 +104,7 @@ class ModelTrainer( pl.LightningModule ):
         mutual_loss = user_distance + item_distance
         regularization_loss = self.model.regularization()
 
-        loss =  prediction_loss - mutual_loss + self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
+        loss =  prediction_loss - 1e-2 * mutual_loss + self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
 
         return loss
 
@@ -141,7 +141,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model_3.pt' )
+        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -204,8 +204,6 @@ def tune_population_based( relation : str ):
         'num_latent' : 64,
         #'batch_size' : 128,
         #'num_group' : 5,
-        #'prediction_margin' : 1,
-        #'transition_margin' : 0.01,
         #'gibb_beta' : 1,
 
         'batch_size' : tune.grid_search([ 32, 64, 128, 256, 512 ]),
@@ -213,7 +211,7 @@ def tune_population_based( relation : str ):
         'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
         'beta' : 1,
         'gamma' : 1,
-        'lr' : 1e-3,
+        'lr' : 1e-4,
 
         # fix parameter
         'relation' : relation,

@@ -225,7 +225,7 @@ class ExpectedKernelModel( nn.Module ):
 
         mu, sigma = torch.chunk( gaussian, 2, dim=1 )
 
-        return 0.5 * ( torch.sum( mu ** 2 ) + torch.sum( sigma ) - self.num_latent - torch.sum( torch.prod( sigma, dim=1 ) ) )
+        return 0.5 * torch.sum( torch.sum( mu ** 2, dim=1 ) + torch.sum( sigma, dim=1 ) - self.num_latent - torch.log( torch.prod( sigma, dim=1 ) ) ) 
 
     def mutual_distance( self ):
         user_gaussian = self.user_gaussian()

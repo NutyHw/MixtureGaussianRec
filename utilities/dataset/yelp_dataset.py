@@ -199,7 +199,7 @@ class YelpDataset( Dataset ):
         return val_mask > 0, val_scores, test_mask > 0, test_scores
 
     def samples( self ):
-        user_count = torch.sum( self.train_adj_mat, dim=-1 ).to( torch.int ).tolist()
+        user_count = torch.sum( self.train_adj_mat > 0, dim=-1 ).to( torch.int ).tolist()
         neg_adj = 1 - self.train_adj_mat
         neg_adj = neg_adj / torch.sum( neg_adj, dim=-1 ).reshape( -1, 1 )
 
