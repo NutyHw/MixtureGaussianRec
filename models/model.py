@@ -5,7 +5,6 @@ import torch.nn.functional as F
 # from torch_geometric.nn import MessagePassing
 # from torch_geometric.utils import add_self_loops, degree
 from torch.utils.data import DataLoader
-# from ml1m_dataset import Ml1mDataset as Dataset
 
 # class GCN( MessagePassing ):
     # def __init__( self, in_dim, out_dim, n, m ):
@@ -214,9 +213,11 @@ class ExpectedKernelModel( nn.Module ):
         self.num_item_mixture = item_mixture
         self.user_gaussian = GaussianEmbedding( num_latent, user_mixture )
         self.item_gaussian = GaussianEmbedding( num_latent, item_mixture )
-        self.user_mixture = MixtureEmbedding( user_mixture, n_users )
-        self.item_mixture = MixtureEmbedding( item_mixture, n_items )
-        self.kl_div_kernel = GMMKlDiv()
+        self.user_mixture = user_mixture
+        self.item_mixture = item_mixture
+        # self.user_mixture = MixtureEmbedding( user_mixture, n_users )
+        # self.item_mixture = MixtureEmbedding( item_mixture, n_items )
+        self.kl_div_kernel = GmmExpectedKernel()
 
     def regularization( self ):
         user_gaussian = self.user_gaussian()
@@ -249,8 +250,8 @@ class ExpectedKernelModel( nn.Module ):
         return F.kl_div( torch.log( P ), group_prob, reduction='sum' )
 
     def forward( self, user_idx, item_idx, is_test=False ):
-        mixture_1 = self.user_mixture( user_idx )
-        mixture_2 = self.item_mixture( item_idx )
+        mixture_1 = self.user_mixture[ user_idx ]
+        mixture_2 = self.item_mixture[ item_idx ]
 
         gaussian_1 = self.user_gaussian()
         gaussian_2 = self.item_gaussian()

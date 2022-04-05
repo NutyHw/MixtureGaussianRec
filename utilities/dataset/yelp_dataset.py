@@ -12,7 +12,7 @@ random.seed( 7 )
 class YelpDataset( Dataset ):
     def __init__( self, relation : str, is_preprocess=False ):
         if not is_preprocess:
-            self.process_dir = './process_datasets/yelp/'
+            self.process_dir = './process_datasets/yelp4/'
             self.relation = relation
             self.load_data()
             self.samples()
@@ -49,9 +49,11 @@ class YelpDataset( Dataset ):
         self.test_mask = dataset['test_mask']
         self.test_score = dataset['test_score']
 
-        metapath = torch.load( os.path.join( self.process_dir, 'metapath.pt' ) )
-        metapath = metapath[ self.relation ] + 1e-6
-        self.metapath = metapath / torch.sum( metapath, dim=-1 ).reshape( -1, 1 )
+        item_metapath = torch.load( os.path.join( self.process_dir, 'metapath.pt' ) )
+        item_metapath = item_metapath[ self.relation ]
+        self.item_metapath = item_metapath / torch.sum( item_metapath, dim=-1 ).reshape( -1, 1 )
+        self.user_metapath = torch.load( os.path.join( self.process_dir, 'user_bcat_kmeans.pt' ) )
+
         self.n_users, self.n_items = self.train_adj_mat.shape
 
     def save_data( self ):
@@ -79,7 +81,7 @@ class YelpDataset( Dataset ):
         return torch.sparse.FloatTensor(i, v, torch.Size(shape)).to_dense()
 
     def get_reg_mat( self ):
-        return self.metapath
+        return self.user_metapath, self.item_metapath
 
     def load_dataset( self ):
         mat = scipy.io.loadmat( './process_datasets/yelp.mat' )
@@ -217,4 +219,4 @@ class YelpDataset( Dataset ):
 
 if __name__ == '__main__':
     dataset = YelpDataset( 'UCom', is_preprocess=False )
-    print( dataset[0] )
+    print( dataset.get_reg_mat() )

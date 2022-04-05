@@ -33,17 +33,19 @@ class ModelTrainer( pl.LightningModule ):
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         print( self.n_users, self.n_items )
 
-        self.true_category = self.dataset.get_reg_mat()
+        user_category, item_category = self.dataset.get_reg_mat()
+
         config['num_group'] = int( round( self.config['num_group'] ) )
 
-        if self.true_category.shape[0] == self.n_users:
-            config['attribute'] = 'user_attribute'
-            self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent'] , config['gibb_beta'] )
-        else:
-            config['attribute'] = 'item_attribute'
-            self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
+        self.model = Model( self.n_users, self.n_items, user_category, item_category, config['num_latent'] , config['gibb_beta'] )
+        # if self.true_category.shape[0] == self.n_users:
+            # config['attribute'] = 'user_attribute'
+            # self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent'] , config['gibb_beta'] )
+        # else:
+            # config['attribute'] = 'item_attribute'
+            # self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
 
-        self.kl_div = nn.KLDivLoss( size_average='sum' )
+        # self.kl_div = nn.KLDivLoss( size_average='sum' )
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
@@ -92,19 +94,19 @@ class ModelTrainer( pl.LightningModule ):
         l2_loss = - torch.sum( torch.log( torch.sigmoid( neg_transition.reshape( -1, 1 ) - pos_transition.reshape( -1, 1 ) ) ) )
         l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
 
-        clustering_loss = None
-        if self.config['attribute'] == 'item_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
-        elif self.config['attribute'] == 'user_attribute':
-            clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
+        # clustering_loss = None
+        # if self.config['attribute'] == 'item_attribute':
+            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
+        # elif self.config['attribute'] == 'user_attribute':
+            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
 
-        user_distance, item_distance = self.model.mutual_distance()
+        # user_distance, item_distance = self.model.mutual_distance()
 
         prediction_loss = l1_loss + l2_loss + l3_loss
-        mutual_loss = user_distance + item_distance
+        # mutual_loss = user_distance + item_distance
         regularization_loss = self.model.regularization()
 
-        loss =  prediction_loss - 1e-2 * mutual_loss + self.config['gamma'] * regularization_loss + self.config['beta'] * clustering_loss
+        loss =  prediction_loss + self.config['gamma'] * regularization_loss 
 
         return loss
 
@@ -207,7 +209,7 @@ def tune_population_based( relation : str ):
         #'gibb_beta' : 1,
 
         'batch_size' : tune.grid_search([ 32, 64, 128, 256, 512 ]),
-        'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
+        # 'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
         'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
         'beta' : 1,
         'gamma' : 1,
