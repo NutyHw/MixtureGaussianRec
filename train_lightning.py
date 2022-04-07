@@ -199,12 +199,16 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        'num_hidden' : tune.grid_search([ 1, 8, 16, 32, 64 ]),
-        'activation' : tune.grid_search([ 'relu', 'tanh' ]),
-        'lr' : tune.grid_search([ 1e-4, 5e-3, 1e-3, 5e-2, 1e-2 ]),
-        'gamma' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1, 1 ]),
+        'num_hidden' : 2,
+        'activation' : 'relu'
+        'lr' : 1e-3,
+        'walks_per_node' : tune.grid_search([ i * 2 for i in range( 3, 11 ) ]),
+        'walk_length' : tune.grid_search([ i * 10 for i in range( 3, 11 ) ]),
+        'context_size' : tune.grid_search([ i * 2 for i in range( 4, 11 ) ]),
 
         # fix parameter
+        'p' : 0.1,
+        'q' : 0.1,
         'relation' : relation,
         'hr_k' : 20,
         'recall_k' : 20,

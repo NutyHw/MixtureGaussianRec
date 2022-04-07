@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GraphConv as GNN
 from torch.utils.data import DataLoader
 from torch_cluster import random_walk
 
@@ -12,9 +12,9 @@ class GCN( nn.Module ):
         model = list()
         for i in range( num_hidden ):
             if i == 0:
-                model.append( SAGEConv( in_dim, num_latent,  normalize=True ) )
+                model.append( GNN( in_dim, num_latent, aggr='max' ) )
             else:
-                model.append( SAGEConv( num_latent, num_latent, normalize=True ) )
+                model.append( GNN( num_latent, num_latent, aggr='max' ) )
 
             if activation == 'relu':
                 model.append( nn.ReLU() )
@@ -36,6 +36,6 @@ class GCN( nn.Module ):
 
 if __name__ == '__main__':
     edge_indices = ( torch.rand( ( 30, 30 ) ) - torch.eye( 30 ) > 0.5 ).nonzero().T
-    model = GCN( 10, 64, 64, activation='relu' )
+    model = GCN( 10, 64, 2, activation='relu' )
     x = torch.rand( ( 30, 10 ) )
     print( model( x, edge_indices ) )
