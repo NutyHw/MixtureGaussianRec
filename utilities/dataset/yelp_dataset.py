@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 
 random.seed( 7 )
 
-class YelpDataset( Dataset ):
+class YelpDataset( object ):
     def __init__( self, relation : str, is_preprocess=False ):
         if not is_preprocess:
             self.process_dir = './process_datasets/yelp4/'
@@ -26,14 +26,8 @@ class YelpDataset( Dataset ):
             self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
             self.save_data()
 
-    def __len__( self ):
-        return 1
-
-    def __getitem__( self, idx ):
-        return self.X, self.train_interact, self.train_adj_mat, self.user_users_sim, self.item_item_sim
-
     def get_val( self ):
-        return self.test_mask, self.test_score
+        return self.val_mask, self.val_score
 
     def get_test( self ):
         return self.test_mask, self.test_score
@@ -45,7 +39,7 @@ class YelpDataset( Dataset ):
         self.train_adj_mat = train_adj_mat
         self.n_users, self.n_items = train_adj_mat.shape
 
-        self.train_interact =  train_adj_mat.nonzero().T
+        self.train_interact = train_adj_mat.nonzero().T
         self.train_interact[ 1 ] += self.n_users
         self.X = F.one_hot( torch.arange( self.n_users + self.n_items ) ).to( torch.float )
 
@@ -200,5 +194,5 @@ class YelpDataset( Dataset ):
 
 if __name__ == '__main__':
     dataset = YelpDataset( 'UCom', is_preprocess=False )
-    print( dataset.n_users, dataset.n_items )
-    print( dataset[0] )
+    X, edge_indices, adj, user_user_sim, item_item_sim = dataset[0]
+    print( user_user_sim.shape, item_item_sim.shape )

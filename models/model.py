@@ -2,8 +2,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GraphConv, Sequential
+from torch_geometric.nn import SAGEConv
 from torch.utils.data import DataLoader
+from torch_cluster import random_walk
 
 class GCN( nn.Module ):
     def __init__( self, in_dim, num_latent, num_hidden, activation='relu' ):
@@ -11,16 +12,17 @@ class GCN( nn.Module ):
         model = list()
         for i in range( num_hidden ):
             if i == 0:
-                model.append( GraphConv( in_dim, num_latent, aggr='add' ) )
+                model.append( SAGEConv( in_dim, num_latent,  normalize=True ) )
             else:
-                model.append( GraphConv( num_latent, num_latent, aggr='add' ) )
+                model.append( SAGEConv( num_latent, num_latent, normalize=True ) )
 
             if activation == 'relu':
                 model.append( nn.ReLU() )
             elif activation == 'tanh':
                 model.append( nn.Tanh() )
 
-            model.append( nn.BatchNorm1d( num_features=num_latent ) )
+            if i < num_hidden - 1:
+                model.append( nn.Dropout( p=0.2 ) )
 
         self.model = nn.ModuleList( model )
 
