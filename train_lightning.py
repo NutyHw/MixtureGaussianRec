@@ -5,8 +5,8 @@ import numpy as np
 from functools import partial
 
 import torch
-import torch.nn as nn
-from models.model import ExpectedKernelModel as Model
+import torch.nn.functional as F
+from models.model import GCN as Model
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -17,8 +17,6 @@ import ray
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
-from ray.tune.suggest import ConcurrencyLimiter
-from ray.tune.suggest.bayesopt import BayesOptSearch
 
 from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
@@ -31,33 +29,17 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
-        print( self.n_users, self.n_items )
 
-        user_category, item_category = self.dataset.get_reg_mat()
-
-        config['num_group'] = int( round( self.config['num_group'] ) )
-
-        self.model = Model( self.n_users, self.n_items, user_category, item_category, config['num_latent'] , config['gibb_beta'] )
-        # if self.true_category.shape[0] == self.n_users:
-            # config['attribute'] = 'user_attribute'
-            # self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent'] , config['gibb_beta'] )
-        # else:
-            # config['attribute'] = 'item_attribute'
-            # self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
-
-        # self.kl_div = nn.KLDivLoss( size_average='sum' )
+        self.model = Model( self.n_users + self.n_items, self.config['num_latent'], self.config['num_hidden'], self.config['activation'] )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
+        return DataLoader( self.dataset, batch_size=1 )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+        return DataLoader( self.dataset, batch_size=1 )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
-
-    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
+        return DataLoader( self.dataset, batch_size=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -79,87 +61,63 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact, weight = batch
-        batch_size = pos_interact.shape[0]
+        X, edge_indices, adj, user_user_sim, item_item_sim  = batch
+        embed = self.model( X, edge_indices )
+        user_embed, item_embed = embed[ : self.n_users ], embed[ self.n_users : ]
 
-        input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
-        unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
-        unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
+        pred_user_user_sim = torch.sigmoid( torch.mm( user_embed, user_embed.T ) )
+        pred_user_item_sim = torch.sigmoid( torch.mm( user_embed, item_embed.T ) )
+        pred_item_item_sim = torch.sigmoid( torch.mm( item_embed, item_embed.T ) )
 
-        mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
-        pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
-        pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
+        loss = torch.linalg.norm( pred_user_user_sim - user_user_sim ) + self.config['gamma'] * ( torch.linalg.norm( pred_user_item_sim - adj ) + torch.linalg.norm( pred_item_item_sim - item_item_sim ) )
 
-        l1_loss = - torch.sum( torch.log( torch.sigmoid( neg_mixture.reshape( -1, 1 ) - pos_mixture.reshape( -1, 1 ) ) ) )
-        l2_loss = - torch.sum( torch.log( torch.sigmoid( neg_transition.reshape( -1, 1 ) - pos_transition.reshape( -1, 1 ) ) ) )
-        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
-
-        # clustering_loss = None
-        # if self.config['attribute'] == 'item_attribute':
-            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
-        # elif self.config['attribute'] == 'user_attribute':
-            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
-
-        # user_distance, item_distance = self.model.mutual_distance()
-
-        prediction_loss = l1_loss + l2_loss + l3_loss
-        # mutual_loss = user_distance + item_distance
-        regularization_loss = self.model.regularization()
-
-        loss =  prediction_loss + self.config['gamma'] * regularization_loss 
+        self.log_dict({
+            'loss' : loss
+        })
 
         return loss
 
-    def on_validation_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
-
     def validation_step( self, batch, batch_idx ):
-        user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
-
-    def on_validation_epoch_end( self ):
+        X, edge_indices, adj, user_user_sim, item_item_sim  = batch
+        embed = self.model( X, edge_indices )
+        user_embed, item_embed = embed[ : self.n_users ], embed[ self.n_users : ]
+        pred_user_item_sim = torch.sigmoid( torch.mm( user_embed, item_embed.T ) )
         val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = -np.inf
+        pred_user_item_sim[ ~val_mask ] = -np.inf
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, pred_user_item_sim, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
             'recall_score' : recall_score,
-            'ndcg_score' : ndcg_score
+            'ndcg_score' : ndcg_score,
         })
 
-    def on_test_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
-
     def test_step( self, batch, batch_idx ):
-        user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
+        X, edge_indices, adj, user_user_sim, item_item_sim  = batch
+        embed = self.model( X, edge_indices )
+        user_embed, item_embed = embed[ : self.n_users ], embed[ self.n_users : ]
+        pred_user_item_sim = torch.sigmoid( torch.mm( user_embed, item_embed.T ) )
+        val_mask, true_y = self.dataset.get_test()
+        pred_user_item_sim[ ~val_mask ] = -np.inf
 
-    def on_test_epoch_end( self ):
-        test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = -np.inf
-
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, pred_user_item_sim, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
             'recall_score' : recall_score,
-            'ndcg_score' : ndcg_score
+            'ndcg_score' : ndcg_score,
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.RMSprop( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=256,
-        num_sanity_val_steps=0,
+        max_epochs=1,
+        limit_train_epoches=1,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
@@ -204,16 +162,10 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        #'batch_size' : 128,
-        #'num_group' : 5,
-        #'gibb_beta' : 1,
-
-        'batch_size' : tune.grid_search([ 32, 64, 128, 256, 512 ]),
-        # 'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
-        'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
-        'beta' : 1,
-        'gamma' : 1,
-        'lr' : 1e-4,
+        'num_hidden' : tune.grid_search([ 1, 8, 16, 32, 64 ]),
+        'activation' : tune.grid_search([ 'relu', 'tanh' ]),
+        'lr' : tune.grid_search([ 1e-4, 5e-3, 1e-3, 5e-2, 1e-2 ]),
+        'gamma' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1, 1 ]),
 
         # fix parameter
         'relation' : relation,
