@@ -10,12 +10,13 @@ from torch.utils.data import Dataset
 
 random.seed( 7 )
 
-class YelpDataset( object ):
+class YelpDataset( Dataset ):
     def __init__( self, relation : str, is_preprocess=False ):
         if not is_preprocess:
             self.process_dir = './process_datasets/yelp4/'
             self.relation = relation
             self.load_data()
+            self.samples()
         else:
             self.UB, self.UU, self.UCom, self.BCat, self.BCity = self.load_dataset()
             self.BCat, self.BCity, self.UU, self.UCom = self.preprocess_relation( self.BCat ), self.preprocess_relation( self.BCity ), self.preprocess_relation( self.UU ), self.preprocess_relation( self.UCom )
@@ -25,6 +26,12 @@ class YelpDataset( object ):
             self.filter( self.pos_train_interact, pos_val_interact, pos_test_interact )
             self.val_mask, self.val_score, self.test_mask, self.test_score = self.create_mask()
             self.save_data()
+
+    def __len__( self ):
+        return self.pos_interact.shape[0]
+
+    def __getitem__( self, idx ):
+        return self.pos_interact[ idx ], self.neg_interact[ idx ]
 
     def get_val( self ):
         return self.val_mask, self.val_score
@@ -39,17 +46,17 @@ class YelpDataset( object ):
         self.train_adj_mat = train_adj_mat
         self.n_users, self.n_items = train_adj_mat.shape
 
-        self.train_interact = train_adj_mat.nonzero().T
-        self.train_interact[ 1 ] += self.n_users
-        self.X = F.one_hot( torch.arange( self.n_users + self.n_items ) ).to( torch.float )
+        #self.train_interact = train_adj_mat.nonzero().T
+        #self.train_interact[ 1 ] += self.n_users
+        #self.X = F.one_hot( torch.arange( self.n_users + self.n_items ) ).to( torch.float )
 
         self.val_mask = dataset['val_mask']
         self.val_score = dataset['val_score']
         self.test_mask = dataset['test_mask']
         self.test_score = dataset['test_score']
 
-        self.user_users_sim = torch.load( os.path.join( self.process_dir, 'bcat', 'user_user_cosine_sim.pt' ) )
-        self.item_item_sim = torch.load( os.path.join( self.process_dir, 'bcat', 'item_item_cosine_sim.pt' ) )
+        #self.user_users_sim = torch.load( os.path.join( self.process_dir, 'bcat', 'user_user_cosine_sim.pt' ) )
+        #self.item_item_sim = torch.load( os.path.join( self.process_dir, 'bcat', 'item_item_cosine_sim.pt' ) )
 
     def save_data( self ):
         torch.save( { 
@@ -192,7 +199,24 @@ class YelpDataset( object ):
 
         return val_mask > 0, val_scores, test_mask > 0, test_scores
 
+    def samples( self ):
+        user_count = torch.sum( self.train_adj_mat > 0, dim=-1 ).to( torch.int ).tolist()
+        neg_adj = 1 - ( self.train_adj_mat > 0 ).to( torch.float )
+        neg_adj = neg_adj / torch.sum( neg_adj, dim=-1 ).reshape( -1, 1 )
+
+        neg_interact = torch.zeros( ( 0, 2 ), dtype=torch.long )
+        for idx, size in enumerate( user_count ):
+            chosen_items = torch.tensor( np.random.choice( self.n_items, size, p=neg_adj[idx].numpy() ) )
+            users = torch.full( chosen_items.shape, idx )
+            interact = torch.vstack( ( users, chosen_items ) ).T
+            neg_interact = torch.vstack( ( neg_interact, interact ) )
+
+        self.pos_interact = self.train_adj_mat.nonzero()
+        self.neg_interact = neg_interact
+        self.weight = self.train_adj_mat[ self.pos_interact[:,0], self.pos_interact[:,1] ]
+
+
 if __name__ == '__main__':
     dataset = YelpDataset( 'UCom', is_preprocess=False )
-    X, edge_indices, adj, user_user_sim, item_item_sim = dataset[0]
-    print( user_user_sim.shape, item_item_sim.shape )
+    pos, neg = dataset[0]
+    print( pos, neg )
