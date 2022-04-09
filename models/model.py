@@ -2,40 +2,33 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GraphConv as GNN
-from torch.utils.data import DataLoader
-from torch_cluster import random_walk
 
-class GCN( nn.Module ):
-    def __init__( self, in_dim, num_latent, num_hidden, activation='relu' ):
+class SiameseModel( nn.Module ):
+    def __init__( self, n, num_latent, num_hidden ):
         super().__init__()
         model = list()
         for i in range( num_hidden ):
             if i == 0:
-                model.append( GNN( in_dim, num_latent, aggr='max' ) )
+                model.append( nn.Linear( n, num_latent ) )
             else:
-                model.append( GNN( num_latent, num_latent, aggr='max' ) )
-
-            if activation == 'relu':
-                model.append( nn.ReLU() )
-            elif activation == 'tanh':
-                model.append( nn.Tanh() )
-
-            if i < num_hidden - 1:
-                model.append( nn.Dropout( p=0.2 ) )
+                model.append( nn.Linear( num_latent, num_latent ) )
+            model.append( nn.LeakyReLU() )
 
         self.model = nn.ModuleList( model )
+        self.xavier_init()
 
-    def forward( self, x, edge_indices ):
+    def xavier_init( self ):
+        for i in range( len (self.model) ):
+            if i % 2 == 0:
+                nn.init.xavier_uniform_( self.model[i].weight )
+
+    def forward( self, x ):
         for i in range( len( self.model ) ):
-            if i % 3 == 0:
-                x = self.model[i]( x, edge_indices )
-            else:
-                x = self.model[i]( x )
+            x = self.model[i]( x )
         return x
 
-if __name__ == '__main__':
-    edge_indices = ( torch.rand( ( 30, 30 ) ) - torch.eye( 30 ) > 0.5 ).nonzero().T
-    model = GCN( 10, 64, 2, activation='relu' )
-    x = torch.rand( ( 30, 10 ) )
-    print( model( x, edge_indices ) )
+if __name__  == '__main__':
+    x = torch.rand( ( 10, 100 ) )
+    model = SiameseModel( 100, 64, 8 )
+    print( model( x ).shape )
+
