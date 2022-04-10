@@ -12,14 +12,17 @@ class SiameseModel( nn.Module ):
                 model.append( nn.Linear( n, num_latent ) )
             else:
                 model.append( nn.Linear( num_latent, num_latent ) )
-            model.append( nn.LeakyReLU() )
+            model.append( nn.ReLU() )
+            model.append( nn.Dropout() )
+
+        model.append( nn.Linear( num_latent, num_latent ) )
 
         self.model = nn.ModuleList( model )
         self.xavier_init()
 
     def xavier_init( self ):
         for i in range( len (self.model) ):
-            if i % 2 == 0:
+            if i % 3 == 0 or i == len( self.model ) - 1:
                 nn.init.xavier_uniform_( self.model[i].weight )
 
     def forward( self, x ):
@@ -29,6 +32,6 @@ class SiameseModel( nn.Module ):
 
 if __name__  == '__main__':
     x = torch.rand( ( 10, 100 ) )
-    model = SiameseModel( 100, 64, 8 )
-    print( model( x ).shape )
+    model = SiameseModel( 100, 64, 32  )
+    print( model( x )  )
 
