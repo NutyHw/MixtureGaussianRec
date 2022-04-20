@@ -8,12 +8,12 @@ from ray import tune
 from scipy.sparse import csr_matrix
 from ndcg import ndcg
 
-from utilities.dataset.ml1m_dataset import Ml1mDataset
+from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 def construct_confidence_mat( dataset ):
-    train_interact = dataset.pos_train_data
+    train_interact = dataset.train_adj_mat
     row = train_interact[:,0]
     col = train_interact[:,1]
     data = torch.ones( row.shape )
@@ -82,7 +82,7 @@ def train_model( config : dict, dataset ):
 
 if __name__ == '__main__':
     ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Ml1mDataset() )
+    dataset = ray.put( Dataset( './yelp_dataset/train_ratio_0.4/' ) )
     config = {
         'num_latent' : tune.randint( 10, 200 ),
         'gamma' : tune.uniform( 1e-5, 1e-1 ),
@@ -96,7 +96,7 @@ if __name__ == '__main__':
         mode='max',
         num_samples=100,
         local_dir='/data2/saito/',
-        name='ml1m_wmf'
+        name='yelp_0.4_wmf'
     )
 
     with open('best_model.json','w') as f:
