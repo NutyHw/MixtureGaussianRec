@@ -32,10 +32,9 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
 
-        self.item_attribute = self.dataset.get_item_attribute()
-
-        self.user_embedding = Model( self.n_users, self.config['num_latent'], self.config['num_hidden'] )
-        self.item_embedding = Model( self.n_items + self.item_attribute.shape[1], self.config['num_latent'], self.config['num_hidden'] )
+        self.item_attribute = self.dataset.item_attribute
+        self.item_prob = ( self.item_attribute + 1e-6 ) / torch.sum( self.item_attribute + 1e-6, dim=-1 ).reshape( -1, 1 )
+        self.model = Model( self.n_users, self.n_items, self.dataset.n_features, self.config['num_latent'], self.config['num_hidden'] )
         self.clustering_model = CluserAssignment()
 
         self.kl_div = nn.KLDivLoss( size_average='batchmean' )
@@ -44,13 +43,13 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def test_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def cross_entropy_loss( self, pred, true ):
-        return torch.sum( true * torch.log( pred ) )
+        return - torch.sum( true * torch.log( pred ), dim=-1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -72,26 +71,22 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
-        pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
+        pred_adj = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
+        pred_loss = torch.mean( self.cross_entropy_loss( pred_adj, adj / torch.sum( adj, dim=-1 ).reshape( -1, 1 ) ) ) 
+        cluster_assignment = self.clustering_model( item_embed, self.item_prob.to( self.device ) )
+        cluster_loss = self.kl_div( torch.log( self.item_prob.to( self.device ) ), cluster_assignment  )
 
-        pred_loss = torch.mean( self.cross_entropy_loss( pred, train_adj ) )
-        cluster_assignment = self.clustering_model( item_embed, self.item_attribute.to( self.device ) )
-
-        cluster_loss = self.kl_div( torch.log( self.item_attribute  + 1e-6 ).to( self.device ), cluster_assignment  )
-
-        return pred_loss + self.config['lambda'] * cluster_loss
+        return pred_loss #+ self.config['lambda'] * cluster_loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
@@ -112,9 +107,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
@@ -139,7 +133,7 @@ class ModelTrainer( pl.LightningModule ):
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=1,
+        max_epochs=32,
         limit_train_batches=1,
         num_sanity_val_steps=0,
         callbacks=[
@@ -185,14 +179,12 @@ def tune_population_based():
     config = {
         # parameter to find
         'num_latent' : 64,
-        'batch_size' : 32,
+        'batch_size' : 256,
         'num_hidden' : 8,
-        'weight_decay' : 1e-2,
-        'lambda' : 1e-1,
         #'num_hidden' : tune.grid_search([ 8, 16, 32 ]),
-        #'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
-        #'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
-        'lr' : 1e-2,
+        'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
+        'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
+        'lr' : 1e-3,
 
         # fix parameter
         'hr_k' : 20,
