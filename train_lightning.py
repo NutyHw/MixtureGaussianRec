@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from models.model import ExpectedKernelModel as Model
+from models.model import Model, CluserAssignment
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -31,33 +31,26 @@ class ModelTrainer( pl.LightningModule ):
         self.config = config
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
-        print( self.n_users, self.n_items )
 
-        user_category, item_category = self.dataset.get_reg_mat()
+        self.item_attribute = self.dataset.get_item_attribute()
 
-        config['num_group'] = int( round( self.config['num_group'] ) )
+        self.user_embedding = Model( self.n_users, self.config['num_latent'], self.config['num_hidden'] )
+        self.item_embedding = Model( self.n_items + self.item_attribute.shape[0], self.config['num_latent'], self.config['num_hidden'] )
+        self.clustering_model = CluserAssignment()
 
-        self.model = Model( self.n_users, self.n_items, user_category, item_category, config['num_latent'] , config['gibb_beta'] )
-        # if self.true_category.shape[0] == self.n_users:
-            # config['attribute'] = 'user_attribute'
-            # self.model = Model( self.n_users, self.n_items, self.true_category.shape[1], config['num_group'], config['num_latent'] , config['gibb_beta'] )
-        # else:
-            # config['attribute'] = 'item_attribute'
-            # self.model = Model( self.n_users, self.n_items, config['num_group'], self.true_category.shape[1], config['num_latent'], config['gibb_beta']  )
-
-        # self.kl_div = nn.KLDivLoss( size_average='sum' )
+        self.kl_div = nn.KLDivLoss( size_average='batchmean' )
 
     def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( torch.arange( self.n_users ).reshape( -1, 1 ) ), batch_size=256, shuffle=False, num_workers=1 )
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
 
-    def joint_loss( self, pos_result1, neg_result1, pos_result2, neg_result2 ):
-        return torch.sum( torch.relu( - ( pos_result1 - neg_result1 ) * ( pos_result2 - neg_result2 ) ) )
+    def cross_entropy_loss( self, pred, true ):
+        return torch.sum( true * torch.log( pred ) )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -79,44 +72,29 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        pos_interact, neg_interact, weight = batch
-        batch_size = pos_interact.shape[0]
+        user_input, item_input, train_adj = batch
+        user_embed = self.user_embedding( user_input )
+        item_embed = self.item_embedding( item_input )
 
-        input_idx = torch.cat( ( pos_interact, neg_interact ), dim=0 )
-        unique_user, inverse_user = torch.unique( input_idx[:,0], return_inverse=True )
-        unique_item, inverse_item = torch.unique( input_idx[:,1], return_inverse=True )
+        pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
 
-        mixture, transition, user_mixture, item_mixture = self.model( unique_user, unique_item )
-        pos_mixture, neg_mixture = torch.chunk( mixture[ inverse_user, inverse_item ], 2 )
-        pos_transition, neg_transition = torch.chunk( transition[ inverse_user, inverse_item ], 2 )
+        pred_loss = torch.mean( self.cross_entropy_loss( pred, train_adj ) )
+        cluster_assignment = self.clustering_model( item_embed, self.item_attribute.to( self.device ) )
 
-        l1_loss = - torch.sum( torch.log( torch.sigmoid( neg_mixture.reshape( -1, 1 ) - pos_mixture.reshape( -1, 1 ) ) ) )
-        l2_loss = - torch.sum( torch.log( torch.sigmoid( neg_transition.reshape( -1, 1 ) - pos_transition.reshape( -1, 1 ) ) ) )
-        l3_loss = self.joint_loss( pos_mixture, neg_mixture, pos_transition, neg_transition )
+        cluster_loss = self.kl_div( torch.log( self.item_attribute  + 1e-6 ).to( self.device ), cluster_assignment  )
 
-        # clustering_loss = None
-        # if self.config['attribute'] == 'item_attribute':
-            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_item ] ).type_as( item_mixture ), item_mixture ) + self.model.clustering_assignment_hardening( user_mixture )
-        # elif self.config['attribute'] == 'user_attribute':
-            # clustering_loss = self.kl_div( torch.log( self.true_category[ unique_user ] ).type_as( user_mixture ), user_mixture ) + self.model.clustering_assignment_hardening( item_mixture )
-
-        # user_distance, item_distance = self.model.mutual_distance()
-
-        prediction_loss = l1_loss + l2_loss + l3_loss
-        # mutual_loss = user_distance + item_distance
-        regularization_loss = self.model.regularization()
-
-        loss =  prediction_loss + self.config['gamma'] * regularization_loss 
-
-        return loss
+        return pred_loss + self.config['lambda'] * cluster_loss
 
     def on_validation_epoch_start( self ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
+        user_input, item_input, train_adj = batch
+        user_embed = self.user_embedding( user_input )
+        item_embed = self.item_embedding( item_input )
+
+        pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
+        self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
 
     def on_validation_epoch_end( self ):
         val_mask, true_y = self.dataset.get_val()
@@ -134,9 +112,12 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        user_idx = batch[0][:,0]
-        res = self.model( user_idx, torch.arange( self.n_items ).type_as( user_idx ), is_test=True )
-        self.y_pred = torch.vstack( ( self.y_pred, res.cpu() ) )
+        user_input, item_input, train_adj = batch
+        user_embed = self.user_embedding( user_input )
+        item_embed = self.item_embedding( item_input )
+
+        pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
+        self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
 
     def on_test_epoch_end( self ):
         test_mask, true_y = self.dataset.get_test()
@@ -152,16 +133,14 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def configure_optimizers( self ):
-        optimizer = optim.RMSprop( self.parameters(), lr=self.config['lr'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=256,
-        num_sanity_val_steps=0,
+        max_epochs=32,
         callbacks=[
-            Scheduler(),
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
                 'recall_score' : 'recall_score',
@@ -204,16 +183,11 @@ def tune_population_based( relation : str ):
     config = {
         # parameter to find
         'num_latent' : 64,
-        #'batch_size' : 128,
-        #'num_group' : 5,
-        #'gibb_beta' : 1,
-
-        'batch_size' : tune.grid_search([ 32, 64, 128, 256, 512 ]),
-        # 'num_group' : tune.grid_search([ 10, 20, 30, 40, 50 ]),
-        'gibb_beta' : tune.grid_search([ 1, 3, 5 ]),
-        'beta' : 1,
-        'gamma' : 1,
-        'lr' : 1e-4,
+        'batch_size' : 32,
+        'num_hidden' : tune.grid_search([ 8, 16, 32 ]),
+        'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
+        'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
+        'lr' : 1e-2,
 
         # fix parameter
         'relation' : relation,

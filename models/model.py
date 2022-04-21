@@ -6,94 +6,57 @@ import torch.nn.functional as F
 # from torch_geometric.utils import add_self_loops, degree
 from torch.utils.data import DataLoader
 
-# class GCN( MessagePassing ):
-    # def __init__( self, in_dim, out_dim, n, m ):
-        # super().__init__(aggr='mean')
-        # self.linear =  nn.Linear( in_dim, out_dim, bias=True )
-        # self.n, self.m = n, m
-
-        # self.init_xavior()
-
-    # def init_xavior( self ):
-        # nn.init.xavier_uniform( self.linear.weight )
-
-    # def forward( self, x, edge_index ):
-        # edge_index, _ = add_self_loops(edge_index, num_nodes=edge_index.size(0))
-        # row, col = edge_index
-        # # transform
-        # x = self.linear( x )
-
-        # # normalize
-        # deg_n = degree(row, self.n, dtype=x.dtype )
-        # deg_m = degree(col, self.m, dtype=x.dtype)
-        # deg_inv_sqrt_n = deg_n.pow(-0.5)
-        # deg_inv_sqrt_m = deg_m.pow(-0.5)
-        # norm = deg_inv_sqrt_n[row] * deg_inv_sqrt_m[col]
-        # deg_inv_sqrt_n[deg_inv_sqrt_n == float('inf')] = 0
-        # deg_inv_sqrt_m[deg_inv_sqrt_m == float('inf')] = 0
-
-        # return self.propagate( edge_index, x=x, norm=norm, size=( self.n, self.m ) )
-
-    # def message( self, x_j, norm ):
-        # return torch.tanh( norm.reshape( -1, 1 ) * x_j )
-
-# class EmbeddingGCN( nn.Module ):
-    # def __init__( self, num_latent, out_dim, num_hidden, n, m ):
-        # super().__init__()
-        # model = list()
-        # assert( num_hidden % 2 == 0 )
-        # for i in range( num_hidden ):
-            # if i == num_hidden - 1:
-                # model.append( GCN( num_latent, out_dim, m, n ) )
-            # elif i % 2 == 0:
-                # model.append( GCN( num_latent, num_latent, n, m ) )
-            # else:
-                # model.append( GCN( num_latent, num_latent, m, n ) )
-
-        # self.model = nn.ModuleList( model )
-        # self.embedding = nn.Embedding( num_embeddings=n, embedding_dim=num_latent )
-
-        # nn.init.xavier_uniform( self.embedding.weight )
-
-    # def forward( self, x, edge_index ):
-        # x = self.embedding( x )
-
-        # for i, model in enumerate( self.model ):
-            # x = model( x, edge_index )
-            # new_edge_index = torch.empty( edge_index.shape, dtype=torch.int64 ).detach()
-            # new_edge_index[0] = edge_index[1]
-            # new_edge_index[1] = edge_index[0]
-            # edge_index = new_edge_index
-
-        # return torch.softmax( x, dim=-1 )
-
-class GaussianEmbedding( nn.Module ):
-    def __init__( self, num_latent, n ):
+class Model( nn.Module ):
+    def __init__( self, input_dim : int, num_latent : int, num_hidden : int ):
         super().__init__()
-        self.params = nn.ParameterDict({
-            'mu' : nn.Parameter( torch.rand( ( n, num_latent ) ) ),
-            'sigma' : nn.Parameter( torch.rand( ( n, num_latent ) ) )
-        })
-        self.init_xavior()
+        layers = list()
+        
+        # add input layer
+        layers.append( nn.Linear( input_dim, num_latent ) )
+        layers.append( nn.ReLU() )
+        layers.append( nn.BatchNorm1d( num_latent ) )
 
-    def init_xavior( self ):
-        nn.init.xavier_normal_( self.params['mu'] )
-        nn.init.xavier_normal_( self.params['sigma'] )
+        # add hidden layer
+        for i in range( num_hidden ):
+            layers.append( nn.Linear( num_latent, num_latent ) )
+            layers.append( nn.ReLU() )
+            layers.append( nn.BatchNorm1d( num_latent ) )
 
-    def forward( self ):
-        return torch.hstack( ( self.params['mu'], torch.exp( self.params['sigma'] ) ) )
+        # add ouput layer
+        layers.append( nn.Linear( num_latent, num_latent ) )
 
-class MixtureEmbedding( nn.Module ):
-    def __init__( self, num_mixture, n ):
+        self.layers = nn.ModuleList( layers )
+
+    def forward( self, X : torch.Tensor ):
+        for i, layer in enumerate( self.layers ):
+            X = layer( X )
+        return X
+
+class CluserAssignment( nn.Module ):
+    def __init__( self ):
         super().__init__()
-        self.mixture = nn.Embedding( num_embeddings=n, embedding_dim=num_mixture )
-        self.init_xavior()
 
-    def init_xavior( self ):
-        nn.init.xavier_normal_( self.mixture.weight )
-    
-    def forward( self, idx ):
-        return torch.softmax( self.mixture( idx ), dim=-1 )
+    def memborship_assignment( self, X, cluster_mask ):
+        '''
+        argument 
+        X : latent representation with shape ( N, num_latent )
+        cluster_mask : mask matrix determine which cluser is sample belong to with shape ( N, num_cluster )
+
+        return :
+        probability of each sample belong to each cluster
+        '''
+        cluster_mu = torch.matmul( cluster_mask.T, X ) / torch.sum( cluster_mask, dim=0 ).reshape( -1, 1 )
+
+        # studen t distribution kernel
+        cluster_dist = torch.sum( torch.sqrt( torch.square( X.unsqueeze( dim=1 ) - cluster_mu.unsqueeze( dim=0 ) ) ), dim=-1 )
+        q = ( 1 + cluster_dist ) ** -1
+        norm_q = q / torch.sum( q, dim=-1 )
+
+        return norm_q
+
+    def forward( self, X : torch.Tensor, cluster_mask ):
+        return self.memborship_assignment( X, cluster_mask )
+
 
 class GMMKlDiv( nn.Module ):
     def __init__( self ):
