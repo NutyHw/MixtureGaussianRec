@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from yelp_dataset import YelpDataset as Dataset
 
 class Model( nn.Module ):
     def __init__( self, n_users, n_items, n_feature, num_latent, num_hidden ):
@@ -16,21 +15,25 @@ class Model( nn.Module ):
 
         layers = list()
 
-        # input layer
+        ## input layer
         layers.append( nn.Linear( num_latent, num_latent ) )
         layers.append( nn.ReLU() )
-        layers.append( nn.BatchNorm1d( num_latent ) )
 
-        # hidden layer
-        for i in range( num_hidden ):
-            layers.append( nn.Linear( num_latent, num_latent ) )
-            layers.append( nn.ReLU() )
-            layers.append( nn.BatchNorm1d( num_latent ) )
+        ## hidden layer
+        #for i in range( num_hidden ):
+        #    layers.append( nn.Linear( num_latent, num_latent ) )
+        #    layers.append( nn.ReLU() )
+        #    layers.append( nn.BatchNorm1d( num_latent ) )
 
-        # output layer
-        layers.append( nn.Linear( num_latent, num_latent ) )
+        ### output layer
+        #layers.append( nn.Linear( num_latent, num_latent ) )
 
-        self.layers = nn.ModuleList( layers )
+        #self.layers = nn.ModuleList( layers )
+
+        # initialize parameter
+        nn.init.xavier_uniform_( self.embed['user_embed'] )
+        nn.init.xavier_uniform_( self.embed['item_embed'] )
+        nn.init.xavier_uniform_( self.embed['feature_embed'] )
 
     def forward( self, user_idx, adj, features ):
         norm_adj = adj / torch.sum( adj, dim=-1 ).reshape( -1, 1 )
@@ -39,11 +42,11 @@ class Model( nn.Module ):
         user_embed = self.embed['user_embed'][ user_idx ] + torch.matmul( norm_adj, self.embed['item_embed'] )
         item_embed = self.embed['item_embed'] + torch.matmul( norm_feature, self.embed['feature_embed'] )
 
-        for i, layer in enumerate( self.layers ):
-            user_embed = layer( user_embed )
-            item_embed = layer( item_embed )
+        #for i, layer in enumerate( self.layers ):
+        #    user_embed = layer( user_embed )
+        #    item_embed = layer( item_embed )
 
-        return user_embed, item_embed
+        return torch.tanh( user_embed ), torch.tanh( item_embed )
 
 class CluserAssignment( nn.Module ):
     def __init__( self ):
