@@ -35,7 +35,7 @@ class ModelTrainer( pl.LightningModule ):
         self.item_attribute = self.dataset.get_item_attribute()
 
         self.user_embedding = Model( self.n_users, self.config['num_latent'], self.config['num_hidden'] )
-        self.item_embedding = Model( self.n_items + self.item_attribute.shape[0], self.config['num_latent'], self.config['num_hidden'] )
+        self.item_embedding = Model( self.n_items + self.item_attribute.shape[1], self.config['num_latent'], self.config['num_hidden'] )
         self.clustering_model = CluserAssignment()
 
         self.kl_div = nn.KLDivLoss( size_average='batchmean' )
@@ -124,7 +124,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
+        torch.save( self.y_pred, f'model_predict.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -139,7 +139,9 @@ class ModelTrainer( pl.LightningModule ):
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=32,
+        max_epochs=1,
+        limit_train_batches=1,
+        num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
@@ -177,20 +179,22 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def tune_population_based( relation : str ):
+def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( relation ) )
+    dataset = ray.put( Dataset( './yelp_dataset/train_ratio_0.6/' ) )
     config = {
         # parameter to find
         'num_latent' : 64,
         'batch_size' : 32,
-        'num_hidden' : tune.grid_search([ 8, 16, 32 ]),
-        'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
-        'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
+        'num_hidden' : 8,
+        'weight_decay' : 1e-2,
+        'lambda' : 1e-1,
+        #'num_hidden' : tune.grid_search([ 8, 16, 32 ]),
+        #'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
+        #'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
         'lr' : 1e-2,
 
         # fix parameter
-        'relation' : relation,
         'hr_k' : 20,
         'recall_k' : 20,
         'ndcg_k' : 100
@@ -210,7 +214,7 @@ def tune_population_based( relation : str ):
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'non_colapse_yelp_dataset_{relation}_3',
+        name=f'my_model_yelp',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg_score',
@@ -218,4 +222,4 @@ def tune_population_based( relation : str ):
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( sys.argv[1] )
+    tune_population_based()
