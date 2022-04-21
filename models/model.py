@@ -2,35 +2,48 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from torch_geometric.nn import MessagePassing
-# from torch_geometric.utils import add_self_loops, degree
 from torch.utils.data import DataLoader
+from yelp_dataset import YelpDataset as Dataset
 
 class Model( nn.Module ):
-    def __init__( self, input_dim : int, num_latent : int, num_hidden : int ):
+    def __init__( self, n_users, n_items, n_feature, num_latent, num_hidden ):
         super().__init__()
+        self.embed = nn.ParameterDict({
+            'user_embed' : nn.Parameter( torch.rand( ( n_users, num_latent ) ).to( torch.float ) ),
+            'item_embed' : nn.Parameter( torch.rand( ( n_items, num_latent ) ).to( torch.float ) ),
+            'feature_embed' : nn.Parameter( torch.rand( n_feature, num_latent ).to( torch.float ) )
+        })
+
         layers = list()
-        
-        # add input layer
-        layers.append( nn.Linear( input_dim, num_latent ) )
+
+        # input layer
+        layers.append( nn.Linear( num_latent, num_latent ) )
         layers.append( nn.ReLU() )
         layers.append( nn.BatchNorm1d( num_latent ) )
 
-        # add hidden layer
+        # hidden layer
         for i in range( num_hidden ):
             layers.append( nn.Linear( num_latent, num_latent ) )
             layers.append( nn.ReLU() )
             layers.append( nn.BatchNorm1d( num_latent ) )
 
-        # add ouput layer
+        # output layer
         layers.append( nn.Linear( num_latent, num_latent ) )
 
         self.layers = nn.ModuleList( layers )
 
-    def forward( self, X : torch.Tensor ):
+    def forward( self, user_idx, adj, features ):
+        norm_adj = adj / torch.sum( adj, dim=-1 ).reshape( -1, 1 )
+        norm_feature = features / torch.sum( features, dim=-1 ).reshape( -1, 1 )
+
+        user_embed = self.embed['user_embed'][ user_idx ] + torch.matmul( norm_adj, self.embed['item_embed'] )
+        item_embed = self.embed['item_embed'] + torch.matmul( norm_feature, self.embed['feature_embed'] )
+
         for i, layer in enumerate( self.layers ):
-            X = layer( X )
-        return X
+            user_embed = layer( user_embed )
+            item_embed = layer( item_embed )
+
+        return user_embed, item_embed
 
 class CluserAssignment( nn.Module ):
     def __init__( self ):
@@ -288,8 +301,12 @@ class ExpectedKernelModel( nn.Module ):
 
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
-   model = ExpectedKernelModel( 600, 4000, 4, 4, 32, 1 )
-   mixture_prob, transition_prob, user_group_prob, item_group_prob = model( torch.tensor([ 2, 3 ]).to( torch.long ), torch.arange( 20 ) ) 
-   print( model.mutual_distance() )
-   print( model.regularization() )
+   dataset = Dataset( './yelp_dataset/train_ratio_0.6/', 20 )
+   dataloader = DataLoader( dataset, batch_size=32 )
+   model = Model( dataset.n_users, dataset.n_items, dataset.n_features, 64, 8 )
+
+   for i, batch in enumerate( dataloader ):
+       user_idx, adj = batch
+       print( model( user_idx, adj, dataset.item_attribute ) )
+       break
 

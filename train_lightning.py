@@ -32,10 +32,8 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
 
-        self.item_attribute = self.dataset.get_item_attribute()
-
-        self.user_embedding = Model( self.n_users, self.config['num_latent'], self.config['num_hidden'] )
-        self.item_embedding = Model( self.n_items + self.item_attribute.shape[0], self.config['num_latent'], self.config['num_hidden'] )
+        self.item_attribute = self.dataset.item_attribute
+        self.model = Model( self.n_users, self.n_items, self.dataset.n_features, self.config['num_latent'], self.config['num_hidden'] )
         self.clustering_model = CluserAssignment()
 
         self.kl_div = nn.KLDivLoss( size_average='batchmean' )
@@ -44,10 +42,10 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ) ), batch_size=self.config['batch_size'], shuffle=False )
 
     def test_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+        return DataLoader( TensorDataset( torch.arange( self.n_users ) ), batch_size=self.config['batch_size'], shuffle=False )
 
     def cross_entropy_loss( self, pred, true ):
         return torch.sum( true * torch.log( pred ) )
@@ -72,16 +70,14 @@ class ModelTrainer( pl.LightningModule ):
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def training_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
-        pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
-
-        pred_loss = torch.mean( self.cross_entropy_loss( pred, train_adj ) )
+        pred_adj = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
+        pred_loss = torch.mean( self.cross_entropy_loss( pred_adj, adj / torch.sum( adj, dim=-1 ).reshape( -1, 1 )  ) )
         cluster_assignment = self.clustering_model( item_embed, self.item_attribute.to( self.device ) )
 
-        cluster_loss = self.kl_div( torch.log( self.item_attribute  + 1e-6 ).to( self.device ), cluster_assignment  )
+        cluster_loss = self.kl_div( torch.log( self.item_attribute + 1e-6 ).to( self.device ), cluster_assignment  )
 
         return pred_loss + self.config['lambda'] * cluster_loss
 
@@ -89,9 +85,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
@@ -112,9 +107,8 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def test_step( self, batch, batch_idx ):
-        user_input, item_input, train_adj = batch
-        user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input[0] )
+        user_idx, adj = batch
+        user_embed, item_embed = self.model( user_idx, adj, self.item_attribute.to( self.device ) )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
@@ -124,7 +118,7 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred[ ~test_mask ] = -np.inf
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-        torch.save( self.y_pred, f'test_yelp_{self.config["relation"]}_non_colapse_model.pt' )
+        torch.save( self.y_pred, f'my_model_predict.pt' )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -177,9 +171,9 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def tune_population_based( relation : str ):
+def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( relation ) )
+    dataset = ray.put( Dataset() )
     config = {
         # parameter to find
         'num_latent' : 64,
@@ -190,7 +184,6 @@ def tune_population_based( relation : str ):
         'lr' : 1e-2,
 
         # fix parameter
-        'relation' : relation,
         'hr_k' : 20,
         'recall_k' : 20,
         'ndcg_k' : 100
@@ -210,7 +203,7 @@ def tune_population_based( relation : str ):
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'non_colapse_yelp_dataset_{relation}_3',
+        name=f'my_model_yelp',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg_score',
@@ -218,4 +211,4 @@ def tune_population_based( relation : str ):
 
     test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 if __name__ == '__main__':
-    tune_population_based( sys.argv[1] )
+    tune_population_based()
