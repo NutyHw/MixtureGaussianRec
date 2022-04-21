@@ -50,7 +50,7 @@ class CluserAssignment( nn.Module ):
         # studen t distribution kernel
         cluster_dist = torch.sum( torch.sqrt( torch.square( X.unsqueeze( dim=1 ) - cluster_mu.unsqueeze( dim=0 ) ) ), dim=-1 )
         q = ( 1 + cluster_dist ) ** -1
-        norm_q = q / torch.sum( q, dim=-1 )
+        norm_q = q / torch.sum( q, dim=-1 ).reshape( -1, 1 )
 
         return norm_q
 
