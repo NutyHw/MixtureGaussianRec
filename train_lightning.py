@@ -74,7 +74,7 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         user_input, item_input, train_adj = batch
         user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input )
+        item_embed = self.item_embedding( item_input[0] )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
 
@@ -91,7 +91,7 @@ class ModelTrainer( pl.LightningModule ):
     def validation_step( self, batch, batch_idx ):
         user_input, item_input, train_adj = batch
         user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input )
+        item_embed = self.item_embedding( item_input[0] )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
@@ -114,7 +114,7 @@ class ModelTrainer( pl.LightningModule ):
     def test_step( self, batch, batch_idx ):
         user_input, item_input, train_adj = batch
         user_embed = self.user_embedding( user_input )
-        item_embed = self.item_embedding( item_input )
+        item_embed = self.item_embedding( item_input[0] )
 
         pred = torch.softmax( torch.matmul( user_embed, item_embed.T ), dim=-1 )
         self.y_pred = torch.vstack( ( self.y_pred, pred.cpu() ) )
