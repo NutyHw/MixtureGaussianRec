@@ -11,6 +11,7 @@ from ndcg import ndcg
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
 def construct_confidence_mat( dataset ):
     train_interact = dataset.train_adj_mat
@@ -49,13 +50,13 @@ def validate_model( model, dataset, csr_matrix ):
     mask, true_y = dataset.get_val()
     y_pred[ ~mask ] = 0
 
-    val_hr_score, val_recall_score, val_ndcg_score = evaluate( true_y, y_pred, 1, 10, 10)
+    val_hr_score, val_recall_score, val_ndcg_score = evaluate( true_y, y_pred, 20, 20, 100 )
 
     mask, true_y = dataset.get_test()
     y_pred = torch.zeros( ( dataset.n_users, dataset.n_items ) ).scatter_( 1, torch.tensor( item_id ).to( torch.int64 ), torch.tensor( score ) )
     y_pred[ ~mask ] = 0
     torch.save( y_pred, 'wmf_predict.pt' )
-    test_hr_score, test_recall_score, test_ndcg_score = evaluate( true_y, y_pred, 1, 10, 10)
+    test_hr_score, test_recall_score, test_ndcg_score = evaluate( true_y, y_pred, 20, 20, 100 )
 
     tune.report({
         'val_hr_score' : val_hr_score,
@@ -73,7 +74,8 @@ def train_model( config : dict, dataset ):
     model = implicit.als.AlternatingLeastSquares( 
         factors=config['num_latent'],
         regularization=config['gamma'],
-        iterations=10
+        iterations=10,
+        use_gpu=True
     )
 
     model.fit( csr_matrix, show_progress=True )
@@ -81,22 +83,22 @@ def train_model( config : dict, dataset ):
     validate_model( model, dataset, csr_matrix )
 
 if __name__ == '__main__':
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( './yelp_dataset/train_ratio_0.4/' ) )
+    ray.init( num_cpus=8, num_gpus=8 )
+    dataset = ray.put( Dataset( './yelp_dataset/train_ratio_0.6/' ) )
     config = {
-        'num_latent' : tune.randint( 10, 200 ),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'num_latent' : tune.grid_search([ 16, 32, 64, 128 ]),
+        'gamma' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
     }
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
         config=config,
         metric='_metric/val_ndcg_score',
         mode='max',
-        num_samples=100,
-        local_dir='/data2/saito/',
-        name='yelp_0.4_wmf'
+        num_samples=1,
+        local_dir=f"./",
+        name='yelp_0.6_wmf'
     )
 
     with open('best_model.json','w') as f:

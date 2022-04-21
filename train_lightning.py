@@ -23,6 +23,7 @@ from utilities.dataset.dataloader import Scheduler
 from utilities.dataset.yelp_dataset import YelpDataset as Dataset
 
 os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
@@ -33,8 +34,8 @@ class ModelTrainer( pl.LightningModule ):
 
         self.model = Model( self.n_users, self.n_items, self.config['num_latent'], self.config['alpha'] )
 
-        with open( './yelp_dataset/train_ratio_0.4/merge_bcat.npy', 'rb' ) as f:
-            self.cluster_mask = torch.from_numpy( np.load( f ) ) + 1e-6
+        with open( '/src/yelp_dataset/train_ratio_0.4/merge_bcat.npy', 'rb' ) as f:
+            self.cluster_mask = torch.from_numpy( np.load( f ) )[ self.dataset.item_mask ] + 1e-6
             self.cluster_mask = self.cluster_mask / torch.sum( self.cluster_mask, dim=-1 ).reshape( -1, 1 )
 
     def train_dataloader( self ):
@@ -73,17 +74,19 @@ class ModelTrainer( pl.LightningModule ):
         res = self.model( input_idx[:,0], input_idx[:,1] )
         pos_res_out, neg_res_out = torch.split( res, split_size_or_sections=batch_size, dim=0 )
 
-        pred_loss = - torch.mean( torch.log( torch.sigmoid( pos_res_out - neg_res_out ) ) )
-        cluster_assignment_loss = torch.mean( F.kl_div( torch.log( self.cluster_mask ), self.model.compute_nll( self.cluster_mask, False ) ) )
+        pred_loss = - torch.sum( torch.log( torch.sigmoid( pos_res_out - neg_res_out ) ) )
+        #cluster_assignment_loss = F.kl_div( torch.log( self.cluster_mask.to( self.device ) ), self.model.compute_nll( self.cluster_mask.T.to( self.device ), False ), reduction='sum' ) 
 
-        return pred_loss + self.config['lambda'] * cluster_assignment_loss
+        loss = pred_loss #+ self.config['lambda'] * cluster_assignment_loss
+
+        return loss
 
     def validation_step( self, batch, batch_idx ):
         val_mask, true_y = self.dataset.get_val()
         y_pred = self.model( None, None, is_test=True )
         y_pred[ ~val_mask ] = - np.inf
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred.cpu(), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -97,7 +100,7 @@ class ModelTrainer( pl.LightningModule ):
         y_pred[ ~test_mask ] = - np.inf
         torch.save( y_pred, 'model_predict.pt' )
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred.cpu(), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -112,8 +115,7 @@ class ModelTrainer( pl.LightningModule ):
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=1,
-        limit_train_epoches=1,
+        max_epochs=32,
         callbacks=[
             Scheduler(),
             TuneReportCheckpointCallback( {
@@ -158,10 +160,11 @@ def tune_population_based():
     config = {
         # parameter to find
         'num_latent' : 64,
+        'batch_size' : 256,
         'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2 ]),
         'weight_decay' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
         'alpha' : tune.grid_search([ 0.1, 0.3, 0.5, 0.7, 0.9 ]),
-        'lambda' : 1e-2,
+        'lambda' : 1e-3,
         'hr_k' : 20,
         'recall_k' : 20,
         'ndcg_k' : 100
@@ -181,7 +184,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'bpr_model_with_modification',
+        name=f'bpr_model',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg_score',

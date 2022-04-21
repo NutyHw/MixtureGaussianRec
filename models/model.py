@@ -47,7 +47,7 @@ class MF( nn.Module ):
             return ( 1 - self.alpha ) * F.cosine_similarity( self.user_embed.weight.unsqueeze( dim=1 ), self.item_embed.weight.unsqueeze( dim=0 ), dim=-1 ) + \
                 self.alpha * torch.mm( self.user_embed.weight, self.item_embed.weight.T )
 
-        return ( 1 - self.alpha ) * F.cosine_similarity( self.user_embed( user_idx ), self.user_embed( item_idx ) ).reshape( -1, 1 ) + \
+        return ( 1 - self.alpha ) * F.cosine_similarity( self.user_embed( user_idx ), self.item_embed( item_idx ) ).reshape( -1, 1 ) + \
             self.alpha * torch.sum( self.user_embed( user_idx ) + self.item_embed( item_idx ), dim=-1 ).reshape( -1, 1 )
 
 if __name__ == '__main__':
@@ -55,7 +55,7 @@ if __name__ == '__main__':
     user_idx = torch.tensor( [ 1, 6 ], dtype=torch.long )
     item_idx = torch.tensor( [ 2, 3 ], dtype=torch.long )
 
-    res = mf( user_idx, item_idx, is_test=True )
+    res = mf( user_idx, item_idx )
     print( res )
     mask = ( torch.rand( ( 4, 10 ) ) > 0.5 ).to( torch.float )
     print( mf.compute_nll( mask, True ) )

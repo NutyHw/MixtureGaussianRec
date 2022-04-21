@@ -8,22 +8,20 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset
 
-random.seed( 7 )
-
 class YelpDataset( Dataset ):
     def __init__( self, process_dataset ):
         with open( os.path.join( process_dataset, 'train_mask' ), 'rb' ) as f:
-            self.train_mask = torch.from_numpy( np.load( f ) )
+            self.train_mask = torch.from_numpy( np.load( f ) ) > 0
         with open( os.path.join( process_dataset, 'val_mask' ), 'rb' ) as f:
-            self.val_mask = torch.from_numpy( np.load( f ) )
+            self.val_mask = torch.from_numpy( np.load( f ) ) > 0
         with open( os.path.join( process_dataset, 'test_mask' ), 'rb' ) as f:
-            self.test_mask = torch.from_numpy( np.load( f ) )
+            self.test_mask = torch.from_numpy( np.load( f ) ) > 0
 
         with open( os.path.join( process_dataset, 'UB.npy' ), 'rb' ) as f:
             self.ub = torch.from_numpy( np.load( f ) )
 
         self.train_adj_mat = self.train_mask * self.ub
-        self.filter_coldstart_item()
+        #self.filter_coldstart_item()
 
         self.n_users, self.n_items = self.train_adj_mat.shape
 
@@ -35,9 +33,10 @@ class YelpDataset( Dataset ):
     def filter_coldstart_item( self ):
         item_mask = torch.sum( self.train_adj_mat , dim=0 ) > 0
 
-        self.train_mask = self.train_mask[ :, item_mask ]
-        self.val_mask = self.val_mask[ :, item_mask ]
-        self.test_mask = self.test_mask[ :, item_mask ]
+        self.ub = self.ub[ :, item_mask ]
+        self.train_mask = self.train_mask[ :, item_mask ] > 0
+        self.val_mask = self.val_mask[ :, item_mask ] > 0
+        self.test_mask = self.test_mask[ :, item_mask ] > 0
         self.train_adj_mat = self.train_adj_mat[ :, item_mask ]
 
         self.item_mask = item_mask
@@ -71,6 +70,6 @@ class YelpDataset( Dataset ):
         self.neg_interact = neg_interact
 
 if __name__ == '__main__':
-    dataset = YelpDataset( './yelp_dataset/train_ratio_0.4/' )
+    dataset = YelpDataset( './yelp_dataset/train_ratio_0.6/' )
     pos, neg = dataset[0]
     print( pos, neg )
