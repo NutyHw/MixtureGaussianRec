@@ -13,10 +13,10 @@ class YelpDataset( Dataset ):
         with open( os.path.join( process_dataset, 'dataset.npz' ), 'rb' ) as f:
             arr = np.load( f )
             self.ub = torch.from_numpy( arr['ub'] )
-            self.item_attribute = torch.from_numpy( arr['bcat'] )
-            self.train_mask = torch.from_numpy( arr['train_mask'] )
-            self.val_mask = torch.from_numpy( arr['val_mask'] )
-            self.test_mask = torch.from_numpy( arr['test_mask'] )
+            self.item_attribute = torch.from_numpy( arr['bcat'] ).to( torch.float )
+            self.train_mask = torch.from_numpy( arr['train_mask'] ) > 0
+            self.val_mask = torch.from_numpy( arr['val_mask'] ) > 0
+            self.test_mask = torch.from_numpy( arr['test_mask'] ) > 0
 
         self.train_adj_mat = self.train_mask * self.ub
         self.n_users, self.n_items = self.train_adj_mat.shape
@@ -71,4 +71,5 @@ class YelpDataset( Dataset ):
 if __name__ == '__main__':
     dataset = YelpDataset( './yelp_dataset/train_ratio_0.8/' )
     user_input, item_input, train_adj = dataset[0]
+    print( dataset.get_item_attribute().shape )
     print( user_input.shape, item_input.shape, train_adj.shape )
