@@ -10,24 +10,20 @@ from torch.utils.data import Dataset
 
 class YelpDataset( Dataset ):
     def __init__( self, process_dataset ):
-        with open( os.path.join( process_dataset, 'train_mask' ), 'rb' ) as f:
-            self.train_mask = torch.from_numpy( np.load( f ) )
-        with open( os.path.join( process_dataset, 'val_mask' ), 'rb' ) as f:
-            self.val_mask = torch.from_numpy( np.load( f ) )
-        with open( os.path.join( process_dataset, 'test_mask' ), 'rb' ) as f:
-            self.test_mask = torch.from_numpy( np.load( f ) )
-        with open( os.path.join( process_dataset, 'UB.npy' ), 'rb' ) as f:
-            self.ub = torch.from_numpy( np.load( f ) )
+        with open( os.path.join( process_dataset, 'dataset.npz' ), 'rb' ) as f:
+            arr = np.load( f )
+            self.ub = torch.from_numpy( arr['ub'] )
+            self.item_attribute = torch.from_numpy( arr['bcat'] )
+            self.train_mask = torch.from_numpy( arr['train_mask'] )
+            self.val_mask = torch.from_numpy( arr['val_mask'] )
+            self.test_mask = torch.from_numpy( arr['test_mask'] )
 
         self.train_adj_mat = self.train_mask * self.ub
         self.n_users, self.n_items = self.train_adj_mat.shape
 
         self.user_input = F.one_hot( torch.arange( self.n_users ) ).to( torch.float )
-
-        with open( os.path.join( process_dataset, 'merge_bcat.npy' ), 'rb' ) as f:
-            item_one_hot = F.one_hot( torch.arange( self.n_items ) ).to( torch.float )
-            self.item_attribute = torch.from_numpy( np.load( f ) ).to( torch.float )
-            self.item_input = torch.hstack( ( item_one_hot, self.item_attribute ) ).to( torch.float )  
+        item_one_hot = F.one_hot( torch.arange( self.n_items ) ).to( torch.float )
+        self.item_input = torch.hstack( ( item_one_hot, self.item_attribute ) ).to( torch.float )  
 
         #self.filter_coldstart_item()
         #self.samples()
@@ -73,6 +69,6 @@ class YelpDataset( Dataset ):
         self.neg_interact = neg_interact
 
 if __name__ == '__main__':
-    dataset = YelpDataset( './yelp_dataset/train_ratio_0.4/' )
+    dataset = YelpDataset( './yelp_dataset/train_ratio_0.8/' )
     user_input, item_input, train_adj = dataset[0]
     print( user_input.shape, item_input.shape, train_adj.shape )
