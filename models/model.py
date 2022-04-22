@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from yelp_dataset import YelpDataset as Dataset
 
 class Encoder( nn.Module ):
     def __init__( self, L : list ):

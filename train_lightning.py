@@ -38,6 +38,9 @@ class ModelTrainer( pl.LightningModule ):
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
+    def val_dataloader( self ):
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
+
     def training_step( self, batch, batch_idx ):
         input = batch
         embed = self.encoder( input )
@@ -69,6 +72,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
         max_epochs=128,
+        limit_train_batches=1,
+        num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
                 'hr_score' : 'hr_score',
@@ -115,7 +120,7 @@ def tune_population_based():
         'batch_size' : 32,
         'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
         'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
-        'lr' : 1e-2,
+        'lr' : 1e-3,
 
         # fix parameter
         'hr_k' : 20,
