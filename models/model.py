@@ -5,45 +5,44 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from yelp_dataset import YelpDataset as Dataset
 
-class Model( nn.Module ):
-    def __init__( self, n_users, n_items, n_feature, num_latent, num_hidden ):
+class Encoder( nn.Module ):
+    def __init__( self, L : list ):
         super().__init__()
-        self.embed = nn.ParameterDict({
-            'user_embed' : nn.Parameter( torch.rand( ( n_users, num_latent ) ).to( torch.float ) ),
-            'item_embed' : nn.Parameter( torch.rand( ( n_items, num_latent ) ).to( torch.float ) ),
-            'feature_embed' : nn.Parameter( torch.rand( n_feature, num_latent ).to( torch.float ) )
-        })
+        self.create_nn_structure( L )
 
-        layers = list()
+    def create_nn_structure( self , L ):
+        self.linear = list()
+        for i in range( len( L ) - 2 ):
+            self.linear.append( nn.Linear( L[i], L[i+1] ) )
+            self.linear.append( nn.ReLU() )
+            self.linear.append( nn.Dropout() )
 
-        # input layer
-        layers.append( nn.Linear( num_latent, num_latent ) )
-        layers.append( nn.ReLU() )
-        layers.append( nn.BatchNorm1d( num_latent ) )
+        self.linear.append( nn.Linear( L[-2], L[-1] ) )
+        self.linear = nn.ModuleList( self.linear )
 
-        # hidden layer
-        for i in range( num_hidden ):
-            layers.append( nn.Linear( num_latent, num_latent ) )
-            layers.append( nn.ReLU() )
-            layers.append( nn.BatchNorm1d( num_latent ) )
+    def forward( self, X ):
+        for i, layer in enumerate( self.linear ):
+            X = layer( X )
+        return X
 
-        # output layer
-        layers.append( nn.Linear( num_latent, num_latent ) )
+class Decoder( nn.Module ):
+    def __init__( self, L : list ):
+        super().__init__()
+        self.create_nn_structure( L )
 
-        self.layers = nn.ModuleList( layers )
+    def create_nn_structure( self , L ):
+        self.linear = list()
+        for i in range( len( L ) - 2 ):
+            self.linear.append( nn.Linear( L[i], L[i+1] ) )
+            self.linear.append( nn.ReLU() )
 
-    def forward( self, user_idx, adj, features ):
-        norm_adj = adj / torch.sum( adj, dim=-1 ).reshape( -1, 1 )
-        norm_feature = features / torch.sum( features, dim=-1 ).reshape( -1, 1 )
+        self.linear.append( nn.Linear( L[-2], L[-1] ) )
+        self.linear = nn.ModuleList( self.linear )
 
-        user_embed = self.embed['user_embed'][ user_idx ] + torch.matmul( norm_adj, self.embed['item_embed'] )
-        item_embed = self.embed['item_embed'] + torch.matmul( norm_feature, self.embed['feature_embed'] )
-
-        for i, layer in enumerate( self.layers ):
-            user_embed = layer( user_embed )
-            item_embed = layer( item_embed )
-
-        return user_embed, item_embed
+    def forward( self, X ):
+        for i, layer in enumerate( self.linear ):
+            X = layer( X )
+        return X
 
 class CluserAssignment( nn.Module ):
     def __init__( self ):
@@ -63,7 +62,7 @@ class CluserAssignment( nn.Module ):
         # studen t distribution kernel
         cluster_dist = torch.sum( torch.sqrt( torch.square( X.unsqueeze( dim=1 ) - cluster_mu.unsqueeze( dim=0 ) ) ), dim=-1 )
         q = ( 1 + cluster_dist ) ** -1
-        norm_q = q / torch.sum( q, dim=-1 )
+        norm_q = q / torch.sum( q, dim=-1 ).reshape( -1, 1 )
 
         return norm_q
 
@@ -301,12 +300,20 @@ class ExpectedKernelModel( nn.Module ):
 
 if __name__ == '__main__':
    # dataset = Dataset( 'item_genre' )
-   dataset = Dataset( './yelp_dataset/train_ratio_0.6/', 20 )
+   dataset = Dataset( './yelp_dataset/', 0, 'BCat', 40 )
    dataloader = DataLoader( dataset, batch_size=32 )
-   model = Model( dataset.n_users, dataset.n_items, dataset.n_features, 64, 8 )
+   layer = [ dataset.attribute.shape[1], 64 ] 
+   encoder = Encoder( layer )
+   decoder = Decoder( layer[::-1] )
 
+   print( encoder )
+   print( decoder )
+   # print( summary( encoder, ( dataset.train_adj_mat.shape[1] ) ) )
    for i, batch in enumerate( dataloader ):
-       user_idx, adj = batch
-       print( model( user_idx, adj, dataset.item_attribute ) )
+       adj = batch
+       embed = encoder( adj )
+       pred = decoder( embed )
+       print( embed )
+       print( pred )
        break
 

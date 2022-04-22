@@ -1,3 +1,4 @@
+import sys
 import os
 import random
 from collections import defaultdict
@@ -9,60 +10,51 @@ import numpy as np
 from torch.utils.data import Dataset
 
 class YelpDataset( Dataset ):
-    def __init__( self, process_dataset, k ):
-        self.k = k
-        with open( os.path.join( process_dataset, 'dataset.npz' ), 'rb' ) as f:
+    def __init__( self, process_dataset, i, attribute, alpha ):
+        self.dataset = torch.load( os.path.join( process_dataset, f'yelp_dataset_{i}.pt' ) )
+
+        with open( os.path.join( process_dataset, 'attribute.npy' ), 'rb' ) as f:
             arr = np.load( f )
-            self.ub = torch.from_numpy( arr['ub'] ).to( torch.float )
-            self.item_attribute = torch.from_numpy( arr['bcat'] ).to( torch.float )
-            self.train_mask = torch.from_numpy( arr['train_mask'] ) > 0
-            self.val_mask = torch.from_numpy( arr['val_mask'] ) > 0
-            self.test_mask = torch.from_numpy( arr['test_mask'] ) > 0
+            if attribute[0] == 'U':
+                self.is_user_attribute = True
+            elif attribute[0] == 'B':
+                self.is_user_attribute = False
 
-        self.train_adj_mat = self.train_mask * self.ub
-        self.filter_no_interact_users()
-        self.n_users, self.n_items = self.train_adj_mat.shape
-        self.n_features = self.item_attribute.shape[1]
+            if attribute == 'UU':
+                self.attribute = torch.from_numpy( arr['UU'] )
+            elif attribute == 'UCom':
+                self.attribute = torch.from_numpy( arr['UCom'] )
+            elif attribute == 'BCat':
+                self.attribute = torch.from_numpy( arr['BCat'] )
+            elif attribute == 'BCity':
+                self.attribute = torch.from_numpy( arr['BCity'] )
+            else:
+                raise Exception('attribute invalid')
 
-        #self.filter_coldstart_item()
-        #self.samples()
+            self.attribute = F.normalize( self.attribute )
+
+        self.create_input( alpha )
+
+    def create_input( self, alpha ):
+        train_adj = self.dataset['train_adj']
+        confidence = ( 1 + alpha * train_adj ) * ( train_adj > 0 )
+        norm_confidence = F.normalize( confidence )
+
+        if self.is_user_attribute:
+            temp = F.normalize( torch.mm( norm_confidence.T, self.attribute ) )
+            self.attribute = torch.vstack( ( self.attribute, temp ) )
+        else:
+            temp = F.normalize( torch.mm( norm_confidence, self.attribute ) )
+            self.attribute = torch.vstack( ( temp, self.attribute ) )
+
+        self.attribute = self.attribute.to( torch.float )
 
     def __len__( self ):
-        return self.n_users
+        return self.attribute.shape[0]
 
     def __getitem__( self, idx ):
-        return idx, self.train_adj_mat[ idx ]
-
-    def get_item_attribute( self ):
-        return self.item_attribute
-
-    def filter_no_interact_users( self ):
-        user_mask = torch.sum( self.train_adj_mat, dim=-1 ) > 0
-        self.train_adj_mat = self.train_adj_mat[ user_mask ]
-        self.train_mask = self.train_mask[ user_mask ]
-        self.val_mask = self.val_mask[ user_mask ]
-        self.test_mask = self.test_mask[ user_mask ]
-        self.ub = self.ub[ user_mask ]
-
-    def get_val( self ):
-        return self.val_mask, self.ub * self.val_mask
-
-    def get_test( self ):
-        return self.test_mask, self.ub * self.test_mask
-
-    def filter_coldstart_item( self ):
-        item_mask = torch.sum( self.train_adj_mat , dim=0 ) > 0
-
-        self.train_mask = self.train_mask[ :, item_mask ]
-        self.val_mask = self.val_mask[ :, item_mask ]
-        self.test_mask = self.test_mask[ :, item_mask ]
-        self.train_adj_mat = self.train_adj_mat[ :, item_mask ]
-        self.item_input = self.item_input[ :, item_mask ]
-
-    def samples( self ):
-        self.pos_interact = self.train_adj_mat.nonzero()
+        return self.attribute[ idx ]
 
 if __name__ == '__main__':
-    dataset = YelpDataset( './yelp_dataset/train_ratio_0.8/', 20 )
-    user_input, item_input, train_adj = dataset[0]
-    dataloader = np._DatetimeScalar
+    dataset = YelpDataset( './yelp_dataset/', 0, 'BCat', 40 )
+    print( dataset[0].type() )
