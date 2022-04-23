@@ -32,7 +32,8 @@ class ModelTrainer( pl.LightningModule ):
         self.dataset = ray.get( dataset )
         layer = [ self.dataset.attribute.shape[1], self.config['num_latent'] ]
 
-        self.encoder = Encoder( layer )
+        self.user_encoder = Encoder( layer )
+        self.item_encoder = Encoder( layer )
         self.decoder = Decoder( layer[::-1] )
 
     def train_dataloader( self ):
@@ -46,10 +47,10 @@ class ModelTrainer( pl.LightningModule ):
         embed = self.encoder( input )
         pred = self.decoder( embed )
 
-        loss = torch.norm( embed - pred )
+        loss = torch.norm( pred - input )
         return loss
 
-    def on_validation_start( self, pred ):
+    def on_validation_start( self ):
         self.loss = 0
         self.counter = 0
 
@@ -58,10 +59,10 @@ class ModelTrainer( pl.LightningModule ):
         embed = self.encoder( input )
         pred = self.decoder( embed )
 
-        self.loss += torch.norm( embed - pred )
+        self.loss += torch.norm( pred - input )
         self.counter += 1
 
-    def on_validation_end( self ):
+    def on_validation_epoch_end( self ):
         self.log_dict({ 'loss' : self.loss / self.counter })
 
     def configure_optimizers( self ):
@@ -72,18 +73,14 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
         max_epochs=128,
-        limit_train_batches=1,
-        num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
-                'hr_score' : 'hr_score',
-                'recall_score' : 'recall_score',
-                'ndcg_score' : 'ndcg_score'
+                'loss' : 'loss'
             },
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="loss", patience=5, mode="min", min_delta=1e-2)
+           EarlyStopping(monitor="loss", patience=10, mode="min", min_delta=1e-3)
         ],
         progress_bar_refresh_rate=0
     )
@@ -113,19 +110,15 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = YelpDataset( './yelp_dataset/', 0, 'BCat', 40 )
+    dataset = ray.put( Dataset( './yelp_dataset/', 0, 'BCat', 40 ) )
     config = {
         # parameter to find
-        'num_latent' : tune.grid_search([ 16, 32, 64, 128 ]),
-        'batch_size' : 32,
+        #'num_latent' : 16,
+        #'weight_decay' : 1e-2,
+        'num_latent' : tune.grid_search([ 16, 32, 64 ]),
         'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
-        'lambda' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
-        'lr' : 1e-3,
-
-        # fix parameter
-        'hr_k' : 20,
-        'recall_k' : 20,
-        'ndcg_k' : 100
+        'batch_size' : 32,
+        'lr' : 1e-2,
     }
 
     scheduler = ASHAScheduler(
@@ -148,6 +141,7 @@ def tune_population_based():
         checkpoint_score_attr='loss',
     )
 
-    test_model( analysis.best_config, analysis.best_checkpoint, dataset )
+    #test_model( analysis.best_config, analysis.best_checkpoint, dataset )
+
 if __name__ == '__main__':
     tune_population_based()
