@@ -28,7 +28,6 @@ class YelpDataset( Dataset ):
             BCat = self.normalize( torch.from_numpy( arr['BCat'] ).to( torch.float ) )
             BCity = self.normalize( torch.from_numpy( arr['BCity'] ).to( torch.float ) )
 
-        print( self.dataset.keys() )
         self.n_users, self.n_items = self.dataset['train_adj'].shape
         user_one_hot = F.one_hot( torch.arange( self.n_users ) ).to( torch.float )
         item_one_hot = F.one_hot( torch.arange( self.n_items ) ).to( torch.float )
@@ -39,7 +38,7 @@ class YelpDataset( Dataset ):
     def create_interact( self ):
         train_adj_mat = self.dataset[ 'train_adj' ]
         pos_interact = train_adj_mat.nonzero()
-        neg_interact = ( 1 - train_adj_mat ).nonzero()
+        neg_interact = ( 1 - ( train_adj_mat > 0 ).to( torch.int ) ).nonzero()
 
         sample_neg_idx = torch.randint( neg_interact.shape[0], ( pos_interact.shape[0], ) )
         sample_neg_interact = neg_interact[ sample_neg_idx ]

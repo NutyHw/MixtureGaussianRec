@@ -33,15 +33,15 @@ class ModelTrainer( pl.LightningModule ):
         self.val_interact, self.val_test_y = self.dataset.val_interact()
         self.test_interact, _ = self.dataset.test_interact()
 
-        user_layer = [ self.dataset.user_input.shape[1], self.config['num_latent'], self.config['num_latent'] ]
-        item_layer = [ self.dataset.item_input.shape[1], self.config['num_latent'], self.config['num_latent'] ]
+        user_layer = [ self.dataset.user_input.shape[1], 200, self.config['num_latent'] ]
+        item_layer = [ self.dataset.item_input.shape[1], 200, self.config['num_latent'] ]
 
         self.user_encoder = Encoder( user_layer )
         self.item_encoder = Encoder( item_layer )
         self.gmf = GMF( self.config['num_latent'] )
         self.loss = nn.BCEWithLogitsLoss( reduction='mean' )
 
-     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
+    def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
         predict_rating = predict_rating[ user_mask ]
         true_rating = true_rating[ user_mask ]
@@ -64,13 +64,10 @@ class ModelTrainer( pl.LightningModule ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
-        return DataLoader( TensorDataset( self.val_interact ), batch_size=self.config['batch_size'], shuffle=False, collate_fn=self.collate_wrapper )
+        return DataLoader( TensorDataset( self.val_interact ), batch_size=self.config['batch_size'], shuffle=False )
 
     def test_dataloader( self ):
-        return DataLoader( TensorDataset( self.test_interact ), batch_size=self.config['batch_size'], shuffle=False, collate_fn=self.collate_wrapper )
-
-    def collate_wrapper( self, batch ):
-        return self.dataset.user_input[ batch[:,0] ], self.dataset.item_input[ batch[:,1] ]
+        return DataLoader( TensorDataset( self.test_interact ), batch_size=self.config['batch_size'], shuffle=False )
 
     def training_step( self, batch, batch_idx ):
         user_input, item_input, true_y = batch
@@ -84,15 +81,15 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, 1 ) )
 
     def validation_step( self, batch, batch_idx ):
-        user_input, item_input = batch
+        user_input, item_input = self.dataset.user_input[ batch[0][:,0] ], self.dataset.item_input[ batch[0][:,1] ]
         user_embed = self.user_encoder( user_input.to( self.device ) )
         item_embed = self.item_encoder( item_input.to( self.device ) )
         y_pred = self.gmf( user_embed * item_embed )
 
-        self.y_pred = torch.vstack( ( self.y_pred, y_pred ) )
+        self.y_pred = torch.vstack( ( self.y_pred, y_pred.cpu() ) )
 
     def on_validation_epoch_end( self ):
-        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.cpu().reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
         self.log_dict( {
             'hr' : hr_score,
             'recall' : recall_score,
@@ -103,15 +100,15 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, 1 ) )
 
     def test_step( self, batch, batch_idx ):
-        user_input, item_input = batch
+        user_input, item_input = self.dataset.user_input[ batch[0][:,0] ], self.dataset.item_input[ batch[0][:,1] ]
         user_embed = self.user_encoder( user_input.to( self.device ) )
         item_embed = self.item_encoder( item_input.to( self.device ) )
         y_pred = self.gmf( user_embed * item_embed )
 
-        self.y_pred = torch.vstack( ( self.y_pred, y_pred ) )
+        self.y_pred = torch.vstack( ( self.y_pred, y_pred.cpu() ) )
 
     def on_test_epoch_end( self ):
-        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.cpu().reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
         self.log_dict( {
             'hr' : hr_score,
             'recall' : recall_score,
@@ -121,13 +118,16 @@ class ModelTrainer( pl.LightningModule ):
 
     def configure_optimizers( self ):
         optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
-        return optimizer
+        scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
+        return [ optimizer ], [ scheduler ]
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=128,
+        max_epochs=64,
+        num_sanity_val_steps=0,
         callbacks=[
+            Scheduler(),
             TuneReportCheckpointCallback( {
                 'hr' : 'hr',
                 'recall' : 'recall',
@@ -136,7 +136,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg", patience=10, mode="min", min_delta=1e-2)
+           EarlyStopping(monitor="ndcg", patience=10, mode="min", min_delta=1e-4)
         ],
         progress_bar_refresh_rate=0
     )
@@ -171,6 +171,7 @@ def tune_population_based():
         # parameter to find
         #'num_latent' : 16,
         #'weight_decay' : 1e-2,
+        #'batch_size' : 32,
         'num_latent' : 64,
         'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
         'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
@@ -181,6 +182,11 @@ def tune_population_based():
         'ndcg_k' : 10
     }
 
+    scheduler = ASHAScheduler(
+        grace_period=10,
+        reduction_factor=2
+    )
+
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
         resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
@@ -189,13 +195,14 @@ def tune_population_based():
         verbose=1,
         num_samples=1,
         config=config,
-        name=f'my_model',
+        scheduler=scheduler,
+        name=f'my_model_yelp_0',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
     )
 
-    #test_model( analysis.best_config, analysis.best_checkpoint, dataset )
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 
 if __name__ == '__main__':
     tune_population_based()
