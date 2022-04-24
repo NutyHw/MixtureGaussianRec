@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from models.model import Encoder, Decoder
+from models.model import Encoder, GMF
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -30,40 +30,94 @@ class ModelTrainer( pl.LightningModule ):
         super().__init__()
         self.config = config
         self.dataset = ray.get( dataset )
-        layer = [ self.dataset.attribute.shape[1], self.config['num_latent'] ]
+        self.val_interact, self.val_test_y = self.dataset.val_interact()
+        self.test_interact, _ = self.dataset.test_interact()
 
-        self.user_encoder = Encoder( layer )
-        self.item_encoder = Encoder( layer )
-        self.decoder = Decoder( layer[::-1] )
+        user_layer = [ self.dataset.user_input.shape[1], self.config['num_latent'], self.config['num_latent'] ]
+        item_layer = [ self.dataset.item_input.shape[1], self.config['num_latent'], self.config['num_latent'] ]
+
+        self.user_encoder = Encoder( user_layer )
+        self.item_encoder = Encoder( item_layer )
+        self.gmf = GMF( self.config['num_latent'] )
+        self.loss = nn.BCEWithLogitsLoss( reduction='mean' )
+
+     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
+        user_mask = torch.sum( true_rating, dim=-1 ) > 0
+        predict_rating = predict_rating[ user_mask ]
+        true_rating = true_rating[ user_mask ]
+
+        _, top_k_indices = torch.topk( predict_rating, k=hr_k, dim=1, largest=True )
+        hr_score = torch.mean( ( torch.sum( torch.gather( true_rating, dim=1, index=top_k_indices ), dim=-1 ) > 0 ).to( torch.float ) )
+
+        _, top_k_indices = torch.topk( predict_rating, k=recall_k, dim=1, largest=True )
+
+        recall_score = torch.mean( 
+            torch.sum( torch.gather( true_rating, dim=1, index = top_k_indices ), dim=1 ) /
+            torch.minimum( torch.sum( true_rating, dim=1 ), torch.tensor( [ recall_k ] ) )
+        )
+
+        ndcg_score = torch.mean( ndcg( predict_rating, true_rating, [ ndcg_k ] ) )
+
+        return hr_score.item(), recall_score.item(), ndcg_score.item()
 
     def train_dataloader( self ):
         return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
 
     def val_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
+        return DataLoader( TensorDataset( self.val_interact ), batch_size=self.config['batch_size'], shuffle=False, collate_fn=self.collate_wrapper )
+
+    def test_dataloader( self ):
+        return DataLoader( TensorDataset( self.test_interact ), batch_size=self.config['batch_size'], shuffle=False, collate_fn=self.collate_wrapper )
+
+    def collate_wrapper( self, batch ):
+        return self.dataset.user_input[ batch[:,0] ], self.dataset.item_input[ batch[:,1] ]
 
     def training_step( self, batch, batch_idx ):
-        input = batch
-        embed = self.encoder( input )
-        pred = self.decoder( embed )
+        user_input, item_input, true_y = batch
+        user_embed = self.user_encoder( user_input )
+        item_embed = self.item_encoder( item_input )
+        y_pred = self.gmf( user_embed * item_embed )
 
-        loss = torch.norm( pred - input )
-        return loss
+        return self.loss( y_pred, true_y )
 
     def on_validation_start( self ):
-        self.loss = 0
-        self.counter = 0
+        self.y_pred = torch.zeros( ( 0, 1 ) )
 
     def validation_step( self, batch, batch_idx ):
-        input = batch
-        embed = self.encoder( input )
-        pred = self.decoder( embed )
+        user_input, item_input = batch
+        user_embed = self.user_encoder( user_input.to( self.device ) )
+        item_embed = self.item_encoder( item_input.to( self.device ) )
+        y_pred = self.gmf( user_embed * item_embed )
 
-        self.loss += torch.norm( pred - input )
-        self.counter += 1
+        self.y_pred = torch.vstack( ( self.y_pred, y_pred ) )
 
     def on_validation_epoch_end( self ):
-        self.log_dict({ 'loss' : self.loss / self.counter })
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.cpu().reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        self.log_dict( {
+            'hr' : hr_score,
+            'recall' : recall_score,
+            'ndcg' : ndcg_score
+        } )
+
+    def on_test_epoch_start( self ):
+        self.y_pred = torch.zeros( ( 0, 1 ) )
+
+    def test_step( self, batch, batch_idx ):
+        user_input, item_input = batch
+        user_embed = self.user_encoder( user_input.to( self.device ) )
+        item_embed = self.item_encoder( item_input.to( self.device ) )
+        y_pred = self.gmf( user_embed * item_embed )
+
+        self.y_pred = torch.vstack( ( self.y_pred, y_pred ) )
+
+    def on_test_epoch_end( self ):
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.cpu().reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        self.log_dict( {
+            'hr' : hr_score,
+            'recall' : recall_score,
+            'ndcg' : ndcg_score
+        } )
+
 
     def configure_optimizers( self ):
         optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
@@ -75,12 +129,14 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
         max_epochs=128,
         callbacks=[
             TuneReportCheckpointCallback( {
-                'loss' : 'loss'
+                'hr' : 'hr',
+                'recall' : 'recall',
+                'ndcg' : 'ndcg'
             },
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="loss", patience=10, mode="min", min_delta=1e-3)
+           EarlyStopping(monitor="ndcg", patience=10, mode="min", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -110,35 +166,33 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 0, 'BCat', 40 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', 0 ) )
     config = {
         # parameter to find
         #'num_latent' : 16,
         #'weight_decay' : 1e-2,
-        'num_latent' : tune.grid_search([ 16, 32, 64 ]),
+        'num_latent' : 64,
         'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
-        'batch_size' : 32,
+        'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
         'lr' : 1e-2,
-    }
 
-    scheduler = ASHAScheduler(
-        grace_period=10,
-        reduction_factor=2
-    )
+        'hr_k' : 1,
+        'recall_k' : 10,
+        'ndcg_k' : 10
+    }
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
         resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
-        metric='loss',
-        mode='min',
+        metric='ndcg',
+        mode='max',
         verbose=1,
         num_samples=1,
         config=config,
-        scheduler=scheduler,
-        name=f'pretrain_yelp',
+        name=f'my_model',
         keep_checkpoints_num=2,
         local_dir=f"./",
-        checkpoint_score_attr='loss',
+        checkpoint_score_attr='ndcg',
     )
 
     #test_model( analysis.best_config, analysis.best_checkpoint, dataset )

@@ -13,6 +13,7 @@ class Encoder( nn.Module ):
         self.linear = list()
         for i in range( len( L ) - 2 ):
             self.linear.append( nn.Linear( L[i], L[i+1] ) )
+            self.linear.append( nn.BatchNorm1d( L[i+1] ) )
             self.linear.append( nn.ReLU() )
             self.linear.append( nn.Dropout() )
 
@@ -24,22 +25,15 @@ class Encoder( nn.Module ):
             X = layer( X )
         return X
 
-class Decoder( nn.Module ):
-    def __init__( self, L : list ):
+class GMF( nn.Module ):
+    def __init__( self, num_latent ):
         super().__init__()
-        self.create_nn_structure( L )
-
-    def create_nn_structure( self , L ):
-        self.linear = list()
-        for i in range( len( L ) - 2 ):
-            self.linear.append( nn.Linear( L[i], L[i+1] ) )
-            self.linear.append( nn.ReLU() )
-
-        self.linear.append( nn.Linear( L[-2], L[-1] ) )
-        self.linear = nn.ModuleList( self.linear )
+        self.model = nn.ModuleList( [
+            nn.Linear( num_latent, 1, bias=False ),
+        ] )
 
     def forward( self, X ):
-        for i, layer in enumerate( self.linear ):
+        for i, layer in enumerate( self.model ):
             X = layer( X )
         return X
 
