@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.bpr import BPR
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.ml1m_dataset import Ml1mDataset
+from utilities.dataset.bpr_dataset import YelpDataset
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -24,6 +24,8 @@ class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
         self.dataset = ray.get( dataset )
+        self.val_interact, self.val_test_y = self.dataset.val_interact()
+        self.test_interact, _ = self.dataset.test_interact()
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.config = config
 
@@ -72,11 +74,10 @@ class ModelTrainer( pl.LightningModule ):
         return loss
 
     def validation_step( self, batch, batch_idx ):
-        val_mask, true_y = self.dataset.get_val()
-        y_pred = self.model( None, None, is_test=True )
-        y_pred[ ~val_mask ] = 0
+        y_pred = self.model( None, None, is_test=True ).cpu()
+        y_pred = torch.gather( y_pred, 1, self.val_interact )
 
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -85,10 +86,11 @@ class ModelTrainer( pl.LightningModule ):
         })
 
     def test_step( self, batch, batch_idx ):
+        y_pred = self.model( None, None, is_test=True ).cpu()
+        y_pred = torch.gather( y_pred, 1, self.test_interact )
+
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
         test_mask, true_y = self.dataset.get_test()
-        y_pred = self.model( None, None, is_test=True )
-        y_pred[ ~test_mask ] = 0
-        torch.save( y_pred, 'bpr_predict.pt' )
 
         hr_score, recall_score, ndcg_score = self.evaluate( true_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
@@ -101,7 +103,7 @@ class ModelTrainer( pl.LightningModule ):
         return y_pred
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['gamma'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
@@ -118,7 +120,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=0.01)
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
         ],
         progress_bar_refresh_rate=0
     )
@@ -142,17 +144,14 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = Ml1mDataset()
-    dataset = ray.put( dataset )
+    ray.init( num_cpus=8, num_gpus=8 )
+    dataset = ray.put( Dataset( './yelp_dataset/', 0 ) )
     config = {
         # grid search parameter
-        'num_latent' : tune.choice([ 8, 16, 32, 64 ]),
-        'gamma' : tune.choice([ 1e-5, 1e-4, 1e-3, 1e-2, 1e-1 ]),
-
-        # hopefully will find right parameter
-        'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
-        'lr' : tune.quniform( 1e-3, 1e-2, 1e-3 ),
+        'num_latent' : 64,
+        'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
+        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2 ]),
 
         'hr_k' : 1,
         'recall_k' : 10,
@@ -169,12 +168,12 @@ def tune_model():
         resources_per_trial={ 'cpu' : 2 },
         metric='ndcg_score',
         mode='max',
-        num_samples=200,
+        num_samples=1,
         verbose=1,
         config=config,
         scheduler=scheduler,
-        name=f'ml1m_bpr',
-        local_dir="/data2/saito/",
+        name=f'yelp_bpr_0',
+        local_dir="",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )
