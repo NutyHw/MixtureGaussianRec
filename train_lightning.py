@@ -33,13 +33,13 @@ class ModelTrainer( pl.LightningModule ):
         self.val_interact, self.val_test_y = self.dataset.val_interact()
         self.test_interact, _ = self.dataset.test_interact()
 
-        user_layer = [ self.dataset.user_input.shape[1], 200, self.config['num_latent'] ]
-        item_layer = [ self.dataset.item_input.shape[1], 200, self.config['num_latent'] ]
+        user_layer = [ self.dataset.user_input.shape[1] ] + self.config['layer']
+        item_layer = [ self.dataset.item_input.shape[1] ] + self.config['layer']
 
         self.user_encoder = Encoder( user_layer )
         self.item_encoder = Encoder( item_layer )
-        self.gmf = GMF( self.config['num_latent'] )
-        self.loss = nn.BCEWithLogitsLoss( reduction='mean' )
+        self.gmf = GMF( self.config['layer'][-1] )
+        self.loss = nn.MSELoss( reduction='mean' )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -117,7 +117,7 @@ class ModelTrainer( pl.LightningModule ):
 
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
         scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
         return [ optimizer ], [ scheduler ]
 
@@ -136,9 +136,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg", patience=10, mode="min", min_delta=1e-4)
-        ],
-        progress_bar_refresh_rate=0
+           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-2)
+        ]
     )
 
     if checkpoint_dir:
@@ -166,15 +165,18 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 0 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start' ) )
     config = {
         # parameter to find
         #'num_latent' : 16,
         #'weight_decay' : 1e-2,
         #'batch_size' : 32,
-        'num_latent' : 64,
-        'weight_decay' :tune.grid_search([ 1e-3, 1e-2, 1e-1 ]), 
         'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
+        'layer' : tune.grid_search([
+            [ 64, 64 ],
+            [ 64 ]
+        ]),
+        'weight_decay' : 1e-3,
         'lr' : 1e-2,
 
         'hr_k' : 1,
@@ -196,7 +198,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_yelp_0',
+        name=f'my_model_cold_start_leiden',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
