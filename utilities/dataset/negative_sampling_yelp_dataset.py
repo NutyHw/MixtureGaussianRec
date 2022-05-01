@@ -26,17 +26,16 @@ class YelpDataset( Dataset ):
             BCity = self.normalize( torch.from_numpy( arr['BCity'] ).to( torch.float ) )
 
         self.n_users, self.n_items = self.dataset['train_adj'].shape
-        print( self.n_users, self.n_items )
         user_one_hot = F.one_hot( torch.arange( self.n_users ) ).to( torch.float )
         item_one_hot = F.one_hot( torch.arange( self.n_items ) ).to( torch.float )
 
-        self.user_input = torch.hstack( ( UU, UCom, user_one_hot ) )
+        self.user_input = torch.hstack( ( UU[ self.dataset['user_mask'] ], UCom[ self.dataset['user_mask'] ], user_one_hot ) )
         self.item_input = torch.hstack( ( BCat, BCity, item_one_hot ) )
 
     def create_interact( self, neg_size : int ):
         train_adj_mat = self.dataset[ 'train_adj' ]
         pos_interact = ( train_adj_mat > 0 ).nonzero()
-        neg_interact = torch.randint( self.n_items, ( pos_interact.shape[0], 10 ) )
+        neg_interact = torch.randint( self.n_items, ( pos_interact.shape[0], neg_size ) )
 
         self.pos_interact = pos_interact
         self.neg_interact = neg_interact

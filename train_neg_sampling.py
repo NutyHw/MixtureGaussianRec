@@ -79,7 +79,7 @@ class ModelTrainer( pl.LightningModule ):
 
         loss = torch.log( pos_y_pred ) + torch.sum( torch.log( neg_y_pred.reshape( -1, self.config['neg_size'], 1 ) ), dim=1 )
 
-        return torch.mean( loss )
+        return - torch.mean( loss )
 
     def on_validation_start( self ):
         self.y_pred = torch.zeros( ( 0, 1 ) )
@@ -172,14 +172,12 @@ def tune_population_based():
     dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
     config = {
         # parameter to find
-        #'num_latent' : 16,
-        #'weight_decay' : 1e-2,
-        #'batch_size' : 32,
         'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
         'layer' : tune.grid_search([
             [ 64, 64 ],
             [ 64 ]
         ]),
+        'neg_size' : 20,
         'weight_decay' : 1e-3,
         'lr' : 1e-2,
 
@@ -202,7 +200,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_cold_start_leiden',
+        name=f'my_model_cold_start_leiden_neg_sampling',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
