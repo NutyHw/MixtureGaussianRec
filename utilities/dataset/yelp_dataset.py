@@ -21,9 +21,9 @@ class YelpDataset( Dataset ):
     def create_input( self, process_dataset ):
         UU, UCom, BCat, BCity = None, None, None,None
 
-        with open( os.path.join( process_dataset, 'attribute.npy' ), 'rb' ) as f:
+        with open( os.path.join( process_dataset, 'attribute_leiden.npz' ), 'rb' ) as f:
             arr = np.load( f )
-            UU = self.normalize( torch.from_numpy( arr['UU'] ).to( torch.float ) )
+            UU = self.normalize( torch.from_numpy( arr['UUCom'] ).to( torch.float ) )
             UCom = self.normalize( torch.from_numpy( arr['UCom'] ).to( torch.float ) )
             BCat = self.normalize( torch.from_numpy( arr['BCat'] ).to( torch.float ) )
             BCity = self.normalize( torch.from_numpy( arr['BCity'] ).to( torch.float ) )
@@ -32,12 +32,12 @@ class YelpDataset( Dataset ):
         user_one_hot = F.one_hot( torch.arange( self.n_users ) ).to( torch.float )
         item_one_hot = F.one_hot( torch.arange( self.n_items ) ).to( torch.float )
 
-        self.user_input = torch.hstack( ( UU, UCom, user_one_hot ) )
+        self.user_input = torch.hstack( ( UU[ self.dataset['user_mask'] ], UCom[ self.dataset['user_mask'] ], user_one_hot ) )
         self.item_input = torch.hstack( ( BCat, BCity, item_one_hot ) )
 
     def create_interact( self ):
         train_adj_mat = self.dataset[ 'train_adj' ]
-        pos_interact = train_adj_mat.nonzero()
+        pos_interact = ( train_adj_mat > 0 ).nonzero()
         neg_interact = ( 1 - ( train_adj_mat > 0 ).to( torch.int ) ).nonzero()
 
         sample_neg_idx = torch.randint( neg_interact.shape[0], ( pos_interact.shape[0], ) )
@@ -74,6 +74,6 @@ class YelpDataset( Dataset ):
         return self.user_input[ self.interact[idx][0] ], self.item_input[ self.interact[idx][1] ], self.Y[idx]
 
 if __name__ == '__main__':
-    dataset = YelpDataset( './yelp_dataset/', 0 )
+    dataset = YelpDataset( './yelp_dataset/', 'cold_start' )
     print( dataset.val_interact() )
     print( dataset.test_interact() )
