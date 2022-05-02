@@ -2,12 +2,10 @@ import os
 import json 
 from functools import partial
 
+from models.model import Ensemble
+from utilities.dataset.ensemble_yelp_dataset import YelpDataset as Dataset
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models.model import Model
-from models.ensemble_model import EnsembleModel
-from utilities.dataset.dataloader import Scheduler
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -16,34 +14,22 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 import ray
 from ray import tune
-from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
-from ray.tune.suggest import ConcurrencyLimiter
-from ray.tune.suggest.bayesopt import BayesOptSearch
-from utilities.dataset.ml1m_dataset import Ml1mDataset as Dataset
-from load_experiment import load_experiment
 
-class EnsembleTrainer( pl.LightningModule ):
-    def __init__( self, dataset, based_model, config ):
+from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
+
+class ModelTrainer( pl.LightningModule ):
+    def __init__( self, config : dict, dataset=None, model=None ):
         super().__init__()
-        self.dataset = ray.get( dataset )
-        self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
         self.config = config
         self.dataset = ray.get( dataset )
-        self.model = EnsembleModel( num_user=self.n_users, num_item=self.n_items, based_model=ray.get( based_model ) )
+        self.model = ray.get( model )
+        self.val_interact, self.val_test_y = self.dataset.val_interact()
+        self.test_interact, _ = self.dataset.test_interact()
 
-    def train_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'] )
-
-    def val_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
-
-    def test_dataloader( self ):
-        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
-
-    def compute_cross_entropy( self, predict_prob, true_prob ):
-        return - torch.sum( true_prob * torch.log( predict_prob ), dim=1 )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
         user_mask = torch.sum( true_rating, dim=-1 ) > 0
@@ -64,96 +50,91 @@ class EnsembleTrainer( pl.LightningModule ):
 
         return hr_score.item(), recall_score.item(), ndcg_score.item()
 
+    def train_dataloader( self ):
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=True )
+
+    def val_dataloader( self ):
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+
+    def test_dataloader( self ):
+        return DataLoader( self.dataset, batch_size=self.config['batch_size'], shuffle=False )
+
     def training_step( self, batch, batch_idx ):
-        user_idx, x_adj, prob_adj = batch
+        user_embed, item_embed, user_weight, item_weight, log_gauss_mat, true_prob = batch
+        log_prob = torch.log( self.model( user_embed, item_embed[0], user_weight, item_weight[0], log_gauss_mat[0] ) )
 
-        norm_true_prob = x_adj / torch.sum( x_adj, dim=-1 ).reshape( -1, 1 )
+        return - torch.mean( torch.sum( log_prob * true_prob, dim=1 ) )
 
-        mixture_prob, transition_prob = self.model( user_idx )
-
-        alpha = max( self.config['alpha'] * self.config['lambda'] ** self.current_epoch, self.config['min_alpha'] )
-        beta = max( self.config['beta2'] * self.config['lambda'] ** self.current_epoch, self.config['min_beta2'] )
-
-        # compute loss
-        l1 = torch.sum( self.compute_cross_entropy( mixture_prob, norm_true_prob ) )
-        l2 = torch.sum( self.compute_cross_entropy( transition_prob, norm_true_prob ) )
-        l3 = F.kl_div( transition_prob, mixture_prob, reduction='sum' )
-
-        loss = alpha * l1 + beta * l2 + l3
-
-        return loss
-
-    def on_validation_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
+    def on_validation_start( self ):
+        self.y_pred = torch.zeros( ( 0, 1 ) )
 
     def validation_step( self, batch, batch_idx ):
-        user_idx, _, _ = batch
-        mixture_prob, _ = self.model( user_idx )
+        user_embed, item_embed, user_weight, item_weight, log_gauss_mat, true_prob = batch
+        pred_prob = self.model( user_embed, item_embed[0], user_weight, item_weight[0], log_gauss_mat[0] )
 
-        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
+        self.y_pred = torch.vstack( ( self.y_pred, pred_prob.cpu() ) )
 
     def on_validation_epoch_end( self ):
-        val_mask, true_y = self.dataset.get_val()
-        self.y_pred[ ~val_mask ] = 0
-
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-
-        self.log_dict({
-            'hr_score' : hr_score,
-            'recall_score' : recall_score,
-            'ndcg_score' : ndcg_score
-        })
+        self.y_pred = torch.gather( self.y_pred, 1, self.val_interact )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        self.log_dict( {
+            'hr' : hr_score,
+            'recall' : recall_score,
+            'ndcg' : ndcg_score
+        } )
 
     def on_test_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, self.n_items ) )
+        self.y_pred = torch.zeros( ( 0, 1 ) )
 
     def test_step( self, batch, batch_idx ):
-        user_idx, _, _ = batch
-        mixture_prob, _ = self.model( user_idx )
-
-        self.y_pred = torch.vstack( ( self.y_pred, mixture_prob ) )
+        user_embed, item_embed, user_weight, item_weight, log_gauss_mat, true_prob = batch
+        pred_prob = self.model( user_embed, item_embed[0], user_weight, item_weight[0], log_gauss_mat[0] )
+        self.y_pred = torch.vstack( ( self.y_pred, pred_prob.cpu() ) )
 
     def on_test_epoch_end( self ):
-        test_mask, true_y = self.dataset.get_test()
-        self.y_pred[ ~test_mask ] = 0
+        self.y_pred = torch.gather( self.y_pred, 1, self.test_interact )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        self.log_dict( {
+            'hr' : hr_score,
+            'recall' : recall_score,
+            'ndcg' : ndcg_score
+        } )
 
-        torch.save( self.y_pred, f'ensemble_predict.pt' )
-        hr_score, recall_score, ndcg_score = self.evaluate( true_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
-
-        self.log_dict({
-            'hr_score' : hr_score,
-            'recall_score' : recall_score,
-            'ndcg_score' : ndcg_score
-        })
 
     def configure_optimizers( self ):
-        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'] )
-        return optimizer
+        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
+        scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
+        return [ optimizer ], [ scheduler ]
 
-def load_models( checkpoint_dir, params ):
-    state_dict = torch.load( os.path.join( checkpoint_dir, 'checkpoint' ) )['state_dict']
-    new_state_dict = dict()
+def train_model( config, checkpoint_dir=None, dataset=None, ensemble_model=None ):
+    trainer = pl.Trainer(
+        gpus=1,
+        max_epochs=64,
+        num_sanity_val_steps=0,
+        callbacks=[
+            TuneReportCheckpointCallback( {
+                'hr' : 'hr',
+                'recall' : 'recall',
+                'ndcg' : 'ndcg'
+            },
+            on='validation_end',
+            filename='checkpoint'
+           ),
+           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-4)
+        ]
+    )
 
-    for key in state_dict.keys():
-        new_state_dict[ key[6:] ] = state_dict[ key ]
+    if checkpoint_dir:
+        config["resume_from_checkpoint"] = os.path.join(
+            checkpoint_dir, "checkpoint"
+        )
 
-    params['num_user'] = new_state_dict['embedding.user_embedding'].shape[0]
-    params['num_item'] = new_state_dict['embedding.item_embedding'].shape[0]
-    params['num_group'] = new_state_dict['embedding.group_mu'].shape[0]
-    params['num_category'] = new_state_dict['embedding.category_mu'].shape[0]
+    model = ModelTrainer( config, dataset, model=ensemble_model )
 
-    if new_state_dict['embedding.user_embedding'].shape[1] == params['num_group']:
-        params['attribute'] = 'item_attribute' 
-    else:
-        params['attribute'] = 'user_attribute' 
+    trainer.fit( model )
 
-    model = Model( **params )
-    model.load_state_dict( state_dict=new_state_dict )
-
-    return model
-
-def test_model( config : dict, checkpoint_dir : str, dataset, based_model ):
-    model = EnsembleTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ), dataset=dataset, based_model=based_model)
+def test_model( config : dict, checkpoint_dir : str, dataset ):
+    model = ModelTrainer.load_from_checkpoint( config=config, checkpoint_path=os.path.join( checkpoint_dir, 'checkpoint' ), dataset=dataset )
 
     trainer = pl.Trainer()
     result = trainer.test( model )
@@ -166,88 +147,44 @@ def test_model( config : dict, checkpoint_dir : str, dataset, based_model ):
     with open('best_model_result.json','w') as f:
         json.dump( save_json, f )
 
-def train_model( config, checkpoint_dir=None, dataset=None, based_model=None):
-    trainer = pl.Trainer(
-        max_epochs=256, 
-        num_sanity_val_steps=0,
-        callbacks=[
-            TuneReportCheckpointCallback( {
-                'hr_score' : 'hr_score',
-                'recall_score' : 'recall_score',
-                'ndcg_score' : 'ndcg_score'
-            },
-            on='validation_end',
-            filename='checkpoint'
-           ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
-        ],
-        progress_bar_refresh_rate=0
-    )
+def tune_population_based():
+    ray.init( num_cpus=8, num_gpus=8 )
+    ensemble_state_dict = torch.load( 'ensemble_state_dict.pt' )
+    model = ray.put( Ensemble( 64, ensemble_state_dict['gmf'], ensemble_state_dict['metapath'] ) )
 
-    model = EnsembleTrainer( dataset=dataset, based_model=based_model, config=config )
-    trainer.fit( model )
-
-def tune_model( best_checkpoint : list, best_config : list ):
-    ray.init( num_cpus=16, _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Dataset( 'item_genre' ) )
-
-    all_models = list()
-    for i in range( len( best_checkpoint ) ):
-        model = load_models( best_checkpoint[i], best_config[i] )
-        all_models.append( model )
-
-    based_model = ray.put( all_models )
-
+    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
     config = {
         # parameter to find
-        'batch_size' : 128,
+        'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
+        'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2 ]),
+        'weight_decay' : 1e-3,
 
-        # hopefully will find right parameter
-        'lr' : tune.uniform( 1e-4, 1e-1 ),
-        'alpha' : tune.uniform( 5, 50 ),
-        'min_alpha' : tune.uniform( 1e-2, 25 ),
-        'beta2' : tune.uniform( 5, 50 ),
-        'min_beta2' : tune.uniform( 1e-2, 25 ),
-        'lambda' : tune.uniform( 0.6, 1 ),
-
-        # fix parameter
         'hr_k' : 1,
         'recall_k' : 10,
         'ndcg_k' : 10
     }
 
-    algo = BayesOptSearch()
-    algo = ConcurrencyLimiter(algo, max_concurrent=10)
-
     scheduler = ASHAScheduler(
-        max_t=256,
         grace_period=10,
         reduction_factor=2
     )
 
     analysis = tune.run( 
-        partial( train_model, dataset=dataset, based_model=based_model),
-        resources_per_trial={ 'cpu' : 2 },
-        metric='ndcg_score',
+        partial( train_model, dataset=dataset, model=model ),
+        resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
+        metric='ndcg',
         mode='max',
-        num_samples=200,
         verbose=1,
+        num_samples=1,
         config=config,
-        search_alg=algo,
         scheduler=scheduler,
-        name=f'ml1m_ensemble_model',
-        local_dir="/data2/saito/",
-        keep_checkpoints_num=1, 
-        checkpoint_score_attr='ndcg_score'
+        name=f'my_model_cold_start_leiden_neg_sampling',
+        keep_checkpoints_num=2,
+        local_dir=f"./",
+        checkpoint_score_attr='ndcg',
     )
 
-    test_model( analysis.best_config, analysis.best_checkpoint, dataset, based_model )
+    test_model( analysis.best_config, analysis.best_checkpoint, dataset )
 
 if __name__ == '__main__':
-    item_genre_best_config, item_genre_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_item_genre' ) 
-    user_age_best_config, user_age_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_user_age' ) 
-    user_jobs_best_config, user_jobs_checkpoint_dir = load_experiment( '/data2/saito/ml1m_dataset_user_jobs' ) 
-    tune_model( 
-            [ item_genre_checkpoint_dir, user_age_checkpoint_dir, user_jobs_checkpoint_dir ],
-            [ item_genre_best_config, user_age_best_config, user_jobs_best_config ]
-    )
+    tune_population_based()
