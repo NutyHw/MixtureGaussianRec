@@ -30,6 +30,7 @@ class GMF( nn.Module ):
         super().__init__()
         self.model = nn.ModuleList( [
             nn.Linear( num_latent, 1, bias=False ),
+            nn.Sigmoid()
         ] )
 
     def forward( self, X ):
