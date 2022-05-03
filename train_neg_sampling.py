@@ -140,7 +140,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-4)
+           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-2)
         ]
     )
 
@@ -169,16 +169,16 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1', neg_size=20 ) )
     config = {
         # parameter to find
-        'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
+        'batch_size' : 32,
         'layer' : tune.grid_search([
             [ 64, 64 ],
             [ 64 ]
         ]),
         'neg_size' : 20,
-        'weight_decay' : 1e-3,
+        'weight_decay' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
         'lr' : 1e-2,
 
         'hr_k' : 1,
@@ -200,7 +200,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_cold_start_leiden_neg_sampling',
+        name=f'my_model_1_leiden_neg_sampling',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
