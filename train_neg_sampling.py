@@ -19,7 +19,8 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+# from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+from utilities.dataset.negative_sampling_ml1m_dataset import Ml1mDataset as Dataset
 
 os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
@@ -169,7 +170,8 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
+    # dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', neg_size=20 ) )
     config = {
         # parameter to find
         'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
