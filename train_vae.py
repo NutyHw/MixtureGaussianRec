@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.vae import loss_function, MultiVAE
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.ml1m_dataset import Ml1mDataset
 from torch.utils.data import DataLoader, TensorDataset
 from ndcg import ndcg
 import torch.optim as optim
@@ -20,24 +19,28 @@ from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
+from utilities.dataset.bpr_dataset import YelpDataset as Dataset
+
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
 class ModelTrainer( pl.LightningModule ):
     def __init__( self, config : dict, dataset=None ):
         super().__init__()
         self.dataset = ray.get( dataset )
         self.config = config
+
+        self.dataset = ray.get( dataset )
         self.n_users, self.n_items = self.dataset.n_users, self.dataset.n_items
-        self.train_adj_mat = self.dataset.adj_mat * self.dataset.train_mask
+        self.val_interact, self.val_test_y = self.dataset.val_interact()
+        self.test_interact, _ = self.dataset.test_interact()
+        self.train_adj_mat = ( self.dataset.dataset[ 'train_adj' ] > 0 ).to( torch.float )
 
         if config['hidden_layer'] == 1:
             self.model = MultiVAE([ 200, 600, self.n_items ])
         elif config['hidden_layer'] == 0:
             self.model = MultiVAE([ 200, self.n_items ])
 
-    def load_dataset( self ):
-        self.train_adj_mat = torch.load( os.path.join( self.dataset_dir, 'train_adj_mat.pt' ) )
-        self.val_dataset = torch.load( os.path.join( self.dataset_dir, 'val_data.pt' ) )
-        self.test_dataset = torch.load( os.path.join( self.dataset_dir, 'test_data.pt' ) )
+        self.normalize()
 
     def normalize( self ):
         row_norm = 1 / torch.sqrt( torch.sum( self.train_adj_mat, dim=1 ) ).reshape( -1, 1 )
@@ -75,7 +78,7 @@ class ModelTrainer( pl.LightningModule ):
         self.model.train()
 
     def training_step( self, batch, batch_idx ):
-        batch_data = self.train_adj_mat[ batch[0].squeeze() ]
+        batch_data = self.train_adj_mat[ batch[0].squeeze() ].to( self.device )
         recon_batch, mu, logvar = self.model(batch_data)
         loss = loss_function( recon_batch, batch_data, mu, logvar, self.config['anneal'] )
 
@@ -88,15 +91,14 @@ class ModelTrainer( pl.LightningModule ):
         self.y_pred = torch.zeros( ( 0, self.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
-        batch_data = self.train_adj_mat[ batch[0].squeeze() ]
+        batch_data = self.train_adj_mat[ batch[0].squeeze() ].to( self.device )
         recon_batch, mu, logvar = self.model(batch_data)
-        self.y_pred = torch.vstack( ( self.y_pred, recon_batch ) )
+        self.y_pred = torch.vstack( ( self.y_pred, recon_batch.cpu() ) )
 
     def on_validation_epoch_end( self ):
-        mask, score = self.dataset.get_val()
-        self.y_pred[ ~mask ] = - np.inf
+        y_pred = torch.gather( self.y_pred, 1, self.val_interact )
 
-        hr_score, recall_score, ndcg_score = self.evaluate( score, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -111,14 +113,12 @@ class ModelTrainer( pl.LightningModule ):
     def test_step( self, batch, batch_idx ):
         batch_data = self.train_adj_mat[ batch[0].squeeze() ]
         recon_batch, mu, logvar = self.model(batch_data)
-        self.y_pred = torch.vstack( ( self.y_pred, recon_batch ) )
+        self.y_pred = torch.vstack( ( self.y_pred, recon_batch.cpu() ) )
 
     def on_test_epoch_end( self ):
-        mask, score = self.dataset.get_test()
-        self.y_pred[ ~mask ] = - np.inf
-        torch.save( self.y_pred, 'vae_predict.pt' )
+        y_pred = torch.gather( self.y_pred, 1, self.test_interact )
 
-        hr_score, recall_score, ndcg_score = self.evaluate( score, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k'] )
 
         self.log_dict({
             'hr_score' : hr_score,
@@ -132,7 +132,8 @@ class ModelTrainer( pl.LightningModule ):
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
-        max_epochs=256, 
+        gpus=1,
+        max_epochs=64,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -143,9 +144,8 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-2)
-        ],
-        progress_bar_refresh_rate=0
+           EarlyStopping(monitor="ndcg_score", patience=10, mode="max", min_delta=1e-4)
+        ]
     )
 
     model = ModelTrainer( config, dataset=dataset )
@@ -168,17 +168,17 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
         json.dump( save_json, f )
 
 def tune_model():
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Ml1mDataset() )
+    ray.init( num_cpus=8, num_gpus=8 )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1' ) )
     config = {
         # grid search parameter
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
 
         # hopefully will find right parameter
-        'batch_size' : tune.choice([ 128, 256, 512, 1024 ]),
-        'hidden_layer' : tune.choice([ 0, 1 ]),
-        'lr' : tune.uniform( 1e-4, 1e-1 ),
+        'hidden_layer' : tune.grid_search([ 0, 1 ]),
         'anneal' : tune.uniform( 0.1, 0.6 ),
+        'gamma' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
 
         'hr_k' : 1,
         'recall_k' : 10,
@@ -192,15 +192,15 @@ def tune_model():
 
     analysis = tune.run( 
         partial( train_model, dataset=dataset ),
-        resources_per_trial={ 'cpu' : 2 },
+        resources_per_trial={ 'cpu' : 1, 'gpu' : 1 },
         metric='ndcg_score',
         mode='max',
-        num_samples=100,
+        num_samples=1,
         verbose=1,
         config=config,
         scheduler=scheduler,
-        name=f'ml1m_vae',
-        local_dir="/data2/saito/",
+        name=f'yelp_vae_1',
+        local_dir=".",
         keep_checkpoints_num=1, 
         checkpoint_score_attr='ndcg_score'
     )

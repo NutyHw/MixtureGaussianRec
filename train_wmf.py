@@ -8,12 +8,13 @@ from ray import tune
 from scipy.sparse import csr_matrix
 from ndcg import ndcg
 
-from utilities.dataset.ml1m_dataset import Ml1mDataset
+from utilities.dataset.bpr_dataset import YelpDataset as Dataset
 
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
+os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
 def construct_confidence_mat( dataset ):
-    train_interact = dataset.pos_train_data
+    train_interact = ( dataset.dataset[ 'train_adj' ] > 0 ).to( torch.float ).nonzero()
     row = train_interact[:,0]
     col = train_interact[:,1]
     data = torch.ones( row.shape )
@@ -44,18 +45,15 @@ def validate_model( model, dataset, csr_matrix ):
     user_id = torch.arange( dataset.n_users )
     item_id, score = model.recommend( user_id, csr_matrix, N=dataset.n_items )
 
+    val_interact, val_test_y = dataset.val_interact()
+    test_interact, _ = dataset.test_interact()
+
     y_pred = torch.zeros( ( dataset.n_users, dataset.n_items ) ).scatter_( 1, torch.tensor( item_id ).to( torch.int64 ), torch.tensor( score ) )
+    val_y_pred = torch.gather( y_pred, 1, val_interact )
+    val_hr_score, val_recall_score, val_ndcg_score = evaluate( val_test_y, val_y_pred, 1, 10, 10)
 
-    mask, true_y = dataset.get_val()
-    y_pred[ ~mask ] = 0
-
-    val_hr_score, val_recall_score, val_ndcg_score = evaluate( true_y, y_pred, 1, 10, 10)
-
-    mask, true_y = dataset.get_test()
-    y_pred = torch.zeros( ( dataset.n_users, dataset.n_items ) ).scatter_( 1, torch.tensor( item_id ).to( torch.int64 ), torch.tensor( score ) )
-    y_pred[ ~mask ] = 0
-    torch.save( y_pred, 'wmf_predict.pt' )
-    test_hr_score, test_recall_score, test_ndcg_score = evaluate( true_y, y_pred, 1, 10, 10)
+    test_y_pred = torch.gather( y_pred, 1, test_interact )
+    test_hr_score, test_recall_score, test_ndcg_score = evaluate( val_test_y, val_y_pred, 1, 10, 10)
 
     tune.report({
         'val_hr_score' : val_hr_score,
@@ -81,11 +79,11 @@ def train_model( config : dict, dataset ):
     validate_model( model, dataset, csr_matrix )
 
 if __name__ == '__main__':
-    ray.init( num_cpus=8,  _temp_dir='/data2/saito/ray_tmp/' )
-    dataset = ray.put( Ml1mDataset() )
+    ray.init( num_cpus=8 )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1' ) )
     config = {
-        'num_latent' : tune.randint( 10, 200 ),
-        'gamma' : tune.uniform( 1e-5, 1e-1 ),
+        'num_latent' : 64,
+        'gamma' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
     }
 
     analysis = tune.run( 
@@ -94,9 +92,9 @@ if __name__ == '__main__':
         config=config,
         metric='_metric/val_ndcg_score',
         mode='max',
-        num_samples=100,
-        local_dir='/data2/saito/',
-        name='ml1m_wmf'
+        num_samples=1,
+        local_dir='.',
+        name='yelp_wmf_1'
     )
 
     with open('best_model.json','w') as f:

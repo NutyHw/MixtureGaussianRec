@@ -15,13 +15,14 @@ class YelpDataset( Dataset ):
         self.dataset_type = dataset_type
 
         self.dataset = torch.load( os.path.join( process_dataset, f'yelp_dataset_{i}.pt' ) )
+        self.n_users, self.n_items = self.dataset['train_adj'].shape
         self.create_interact()
 
     def create_interact( self ):
         num_samples = torch.sum( self.dataset[ 'train_adj' ] > 0, dim=-1 ).reshape( -1, 1 )
         neg_adj = ( 1 - ( self.dataset[ 'train_adj' ] > 0 ).to( torch.float ) )
 
-        pos_interact = self.dataset['train_adj'].nonzero()
+        pos_interact = ( self.dataset['train_adj'] > 0 ).nonzero()
         neg_interact = torch.zeros( ( 0, 2 ), dtype=torch.long )
 
         for idx in range( num_samples.shape[0] ):
@@ -31,22 +32,21 @@ class YelpDataset( Dataset ):
 
         self.pos_interact = pos_interact
         self.neg_interact = neg_interact
+        
+        print( self.pos_interact.shape )
+        print( self.neg_interact.shape )
 
     def val_interact( self ):
         val_data = self.dataset['val_dataset']
-        user_idx = torch.arange( self.n_users ).reshape( -1, 1 ).tile( 1, 101 ).reshape( -1, 1 )
-        item_idx = val_data.reshape( -1, 1 )
         y = torch.hstack( ( torch.ones( ( self.n_users, 1 ) ), torch.zeros( ( self.n_users, 100 ) ) ) )
 
-        return torch.hstack( ( user_idx, item_idx ) ), y
+        return val_data, y
 
     def test_interact( self ):
-        val_data = self.dataset['test_dataset']
-        user_idx = torch.arange( self.n_users ).reshape( -1, 1 ).tile( 1, 101 ).reshape( -1, 1 )
-        item_idx = val_data.reshape( -1, 1 )
+        test_data = self.dataset['test_dataset']
         y = torch.hstack( ( torch.ones( ( self.n_users, 1 ) ), torch.zeros( ( self.n_users, 100 ) ) ) )
 
-        return torch.hstack( ( user_idx, item_idx ) ), y
+        return test_data, y
 
     def __len__( self ):
         return self.pos_interact.shape[0]
@@ -55,5 +55,6 @@ class YelpDataset( Dataset ):
         return self.pos_interact[ idx ], self.neg_interact[ idx ]
 
 if __name__ == '__main__':
-    dataset = YelpDataset( './yelp_dataset/', 0 )
+    dataset = YelpDataset( './yelp_dataset/', 'seen_val_test' )
     print( dataset[ 2896 ] )
+    print( dataset.val_interact() )
