@@ -19,7 +19,8 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
 from utilities.dataset.dataloader import Scheduler
-from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+#from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+from utilities.dataset.negative_sampling_ml1m_dataset import Ml1mDataset as Dataset
 
 os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
@@ -121,7 +122,7 @@ class ModelTrainer( pl.LightningModule ):
 
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
         scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
         return [ optimizer ], [ scheduler ]
 
@@ -140,7 +141,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-2)
+           EarlyStopping(monitor="ndcg", patience=5, mode="max", min_delta=1e-3)
         ]
     )
 
@@ -169,17 +170,17 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', '1', neg_size=20 ) )
+    #dataset = ray.put( Dataset( './yelp_dataset/', '1', neg_size=20 ) )
+    dataset = ray.put( Dataset( './ml1m_dataset/', neg_size=20 ) )
     config = {
         # parameter to find
-        'batch_size' : 32,
+        'batch_size' : tune.grid_search([ 32, 128, 512 ]),
         'layer' : tune.grid_search([
-            [ 64, 64 ],
             [ 64 ]
         ]),
+        'weight_decay' : 1e-3,
         'neg_size' : 20,
-        'weight_decay' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        'lr' : 1e-2,
+        'lr' : tune.grid_search([ 1e-3, 1e-2, 1e-1 ]),
 
         'hr_k' : 1,
         'recall_k' : 10,
@@ -187,7 +188,7 @@ def tune_population_based():
     }
 
     scheduler = ASHAScheduler(
-        grace_period=10,
+        grace_period=5,
         reduction_factor=2
     )
 
@@ -200,7 +201,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_1_leiden_neg_sampling',
+        name=f'my_model_ml1m_neg_samples',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
