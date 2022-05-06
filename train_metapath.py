@@ -29,6 +29,7 @@ class ModelTrainer( pl.LightningModule ):
 
         self.model = nn.Sequential(
                 nn.Linear( self.config['n_cluster'], self.config['n_cluster'] ),
+                nn.Sigmoid()
             )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
@@ -63,8 +64,10 @@ class ModelTrainer( pl.LightningModule ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
 
         transition_prob = self.model( log_gauss_mat )
+        prob = torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
+        log_prob = torch.log( norm_prob )
 
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T ), dim=-1 )
 
         return - torch.mean( torch.sum( log_prob * true_prob, dim=1 ) )
 
@@ -74,7 +77,9 @@ class ModelTrainer( pl.LightningModule ):
     def validation_step( self, batch, batch_idx ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
         transition_prob = self.model( log_gauss_mat )
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T ), dim=-1 )
+        prob = torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
+        log_prob = torch.log( norm_prob )
 
         self.y_pred = torch.vstack( ( self.y_pred, log_prob.cpu() ) )
 
@@ -93,7 +98,9 @@ class ModelTrainer( pl.LightningModule ):
     def test_step( self, batch, batch_idx ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
         transition_prob = self.model( log_gauss_mat )
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight.T ), dim=-1 )
+        prob = torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
+        log_prob = torch.log( norm_prob )
 
         self.y_pred = torch.vstack( ( self.y_pred, log_prob.cpu() ) )
 
@@ -108,9 +115,8 @@ class ModelTrainer( pl.LightningModule ):
 
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
-        scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
-        return [ optimizer ], [ scheduler ]
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
+        return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
@@ -155,7 +161,7 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1', neg_size=20 ) )
     config = {
         # parameter to find
         'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
@@ -181,7 +187,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_cold_start_leiden_neg_sampling',
+        name=f'metapath_model',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
