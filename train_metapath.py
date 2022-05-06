@@ -15,7 +15,7 @@ from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 
-from utilities.dataset.negative_sampling_yelp_dataset import YelpDataset as Dataset
+from utilities.dataset.metapath_yelp_dataset import YelpDataset as Dataset
 
 os.environ['RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE'] = '1'
 
@@ -29,6 +29,7 @@ class ModelTrainer( pl.LightningModule ):
 
         self.model = nn.Sequential(
                 nn.Linear( self.config['n_cluster'], self.config['n_cluster'] ),
+                nn.Sigmoid()
             )
 
     def evaluate( self, true_rating, predict_rating, hr_k, recall_k, ndcg_k ):
@@ -62,25 +63,27 @@ class ModelTrainer( pl.LightningModule ):
     def training_step( self, batch, batch_idx ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
 
-        transition_prob = self.model( log_gauss_mat )
+        transition_prob = self.model( log_gauss_mat[0] )
 
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T ), dim=-1 )
+        prob = torch.linalg.multi_dot( ( user_weight, transition_prob, item_weight[0].T ) )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
-        return - torch.mean( torch.sum( log_prob * true_prob, dim=1 ) )
+        return - torch.mean( torch.sum( torch.log( norm_prob ) * true_prob, dim=1 ) )
 
     def on_validation_start( self ):
-        self.y_pred = torch.zeros( ( 0, 1 ) )
+        self.y_pred = torch.zeros( ( 0, self.dataset.n_items ) )
 
     def validation_step( self, batch, batch_idx ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
-        transition_prob = self.model( log_gauss_mat )
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight[0].T ), dim=-1 )
+        transition_prob = self.model( log_gauss_mat[0] )
+        prob = torch.linalg.multi_dot( ( user_weight, transition_prob, item_weight[0].T ) )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
-        self.y_pred = torch.vstack( ( self.y_pred, log_prob.cpu() ) )
+        self.y_pred = torch.vstack( ( self.y_pred, norm_prob.cpu() ) )
 
     def on_validation_epoch_end( self ):
         self.y_pred = torch.gather( self.y_pred, 1, self.val_interact )
-        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
         self.log_dict( {
             'hr' : hr_score,
             'recall' : recall_score,
@@ -88,18 +91,19 @@ class ModelTrainer( pl.LightningModule ):
         } )
 
     def on_test_epoch_start( self ):
-        self.y_pred = torch.zeros( ( 0, 1 ) )
+        self.y_pred = torch.zeros( ( 0, self.dataset.n_items ) )
 
     def test_step( self, batch, batch_idx ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
-        transition_prob = self.model( log_gauss_mat )
-        log_prob = torch.log_softmax( torch.linalg.multi_dot( user_weight, transition_prob, item_weight.T ), dim=-1 )
+        transition_prob = self.model( log_gauss_mat[0] )
+        prob = torch.linalg.multi_dot( ( user_weight, transition_prob, item_weight[0].T ) )
+        norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
-        self.y_pred = torch.vstack( ( self.y_pred, log_prob.cpu() ) )
+        self.y_pred = torch.vstack( ( self.y_pred, norm_prob.cpu() ) )
 
     def on_test_epoch_end( self ):
         self.y_pred = torch.gather( self.y_pred, 1, self.test_interact )
-        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred.reshape( -1, 101 ), self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
+        hr_score, recall_score, ndcg_score = self.evaluate( self.val_test_y, self.y_pred, self.config['hr_k'], self.config['recall_k'], self.config['ndcg_k']  )
         self.log_dict( {
             'hr' : hr_score,
             'recall' : recall_score,
@@ -109,13 +113,12 @@ class ModelTrainer( pl.LightningModule ):
 
     def configure_optimizers( self ):
         optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
-        scheduler = { "scheduler" : optim.lr_scheduler.ReduceLROnPlateau( optimizer, mode='max', patience=5, threshold=1e-3 ), "monitor" : "ndcg" }
-        return [ optimizer ], [ scheduler ]
+        return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=64,
+        max_epochs=32,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -155,12 +158,13 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', 'cold_start', neg_size=20 ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1' ) )
     config = {
         # parameter to find
-        'batch_size' : tune.grid_search([ 32, 64, 128, 256 ]),
-        'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2 ]),
-        'weight_decay' : 1e-3,
+        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
+        'weight_decay' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
+        'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
+        'n_cluster' : 3,
 
         'hr_k' : 1,
         'recall_k' : 10,
@@ -181,7 +185,7 @@ def tune_population_based():
         num_samples=1,
         config=config,
         scheduler=scheduler,
-        name=f'my_model_cold_start_leiden_neg_sampling',
+        name=f'metapath_model_yelp_1',
         keep_checkpoints_num=2,
         local_dir=f"./",
         checkpoint_score_attr='ndcg',
