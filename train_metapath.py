@@ -28,7 +28,7 @@ class ModelTrainer( pl.LightningModule ):
         self.test_interact, _ = self.dataset.test_interact()
 
         self.model = nn.Sequential(
-                nn.Linear( self.config['n_cluster'], self.config['n_cluster'] ),
+                nn.Linear( 10, 10 ),
                 nn.Sigmoid()
             )
 
@@ -64,7 +64,6 @@ class ModelTrainer( pl.LightningModule ):
         user_weight, item_weight, log_gauss_mat, true_prob = batch
 
         transition_prob = self.model( log_gauss_mat[0] )
-
         prob = torch.linalg.multi_dot( ( user_weight, transition_prob, item_weight[0].T ) )
         norm_prob = prob / torch.sum( prob, dim=-1 ).reshape( -1, 1 )
 
@@ -112,13 +111,13 @@ class ModelTrainer( pl.LightningModule ):
 
 
     def configure_optimizers( self ):
-        optimizer = optim.SGD( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
+        optimizer = optim.Adam( self.parameters(), lr=self.config['lr'], weight_decay=self.config['weight_decay'] )
         return optimizer
 
 def train_model( config, checkpoint_dir=None, dataset=None ):
     trainer = pl.Trainer(
         gpus=1,
-        max_epochs=32,
+        max_epochs=64,
         num_sanity_val_steps=0,
         callbacks=[
             TuneReportCheckpointCallback( {
@@ -129,7 +128,7 @@ def train_model( config, checkpoint_dir=None, dataset=None ):
             on='validation_end',
             filename='checkpoint'
            ),
-           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-4)
+           EarlyStopping(monitor="ndcg", patience=10, mode="max", min_delta=1e-3)
         ]
     )
 
@@ -158,13 +157,12 @@ def test_model( config : dict, checkpoint_dir : str, dataset ):
 
 def tune_population_based():
     ray.init( num_cpus=8, num_gpus=8 )
-    dataset = ray.put( Dataset( './yelp_dataset/', '1' ) )
+    dataset = ray.put( Dataset( './yelp_dataset/', '1', 'yelp_gmm_result.npz', 20 ) )
     config = {
         # parameter to find
-        'batch_size' : tune.grid_search([ 128, 256, 512, 1024 ]),
-        'weight_decay' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
+        'batch_size' : tune.grid_search([ 32, 128, 512 ]),
         'lr' : tune.grid_search([ 1e-4, 1e-3, 1e-2, 1e-1 ]),
-        'n_cluster' : 3,
+        'weight_decay' : 1e-3,
 
         'hr_k' : 1,
         'recall_k' : 10,
